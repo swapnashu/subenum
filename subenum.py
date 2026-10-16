@@ -154,7 +154,7 @@ json schema (schema_version 1; keys are additive-only, never renamed/removed):
   cves [str]           cdn {host: [tag]}    surface {emails, phones,
                                              internal_ips, sens_params}
 """
-import asyncio, aiohttp, re, sys, time, os, argparse, json, base64, ssl, html, ipaddress, hmac, hashlib, struct
+import asyncio, aiohttp, re, sys, time, os, argparse, json, base64, ssl, html, ipaddress, hmac, hashlib, struct, secrets
 import shutil, zipfile, platform, socket, subprocess, tempfile, io, random, gzip, glob
 import xml.etree.ElementTree as ET
 from collections import deque, Counter
@@ -181,6 +181,23 @@ SYS_SEM = asyncio.Semaphore(60)
 HTTP_SEM = asyncio.Semaphore(120)
 PORT_SEM = asyncio.Semaphore(400)
 FAILS = [0]
+# W5 - aggregated check failures: return_exceptions=True gathers used to print
+# and forget; these are surfaced in /api/stats, the end-of-scan summary and the
+# smoke gate (smoke_final.py fails the run when non-empty).
+CHECK_ERRORS = []          # [(tag, message)] - capped, per-run
+_CHECK_ERR_CAP = 200
+
+
+def record_error(tag, msg):
+    if len(CHECK_ERRORS) < _CHECK_ERR_CAP:
+        CHECK_ERRORS.append((str(tag), str(msg)[:300]))
+
+
+def note_check_error(tag, msg):
+    """record + print a check failure (exact legacy `  [tag] msg` line)."""
+    record_error(tag, msg)
+    print(f"  [{tag}] {msg}", flush=True)
+
 RESOLVER_MODE = "auto"
 SYS_RES = None
 DOH = ["https://dns.google/resolve?name={h}&type={t}",
@@ -7669,7 +7686,7 @@ async def content_discovery(probes, findings, dir_paths, cap_hosts=120):
             try:
                 await coro
             except Exception as e:
-                print(f"  [dirs] failed: {e}", flush=True)
+                note_check_error("dirs", f"failed: {e}")
             done += 1
             if done % 2000 == 0:
                 print(f"  [dirs] {done}/{len(jobs)} checks, {len(rows)} hits", flush=True)
@@ -7984,7 +8001,7 @@ async def api_spec(probes, findings, cap_hosts=150, schema_out=""):
                     f.write("\n")
             print(f"  [api] -> graphql schema dump: {schema_out}", flush=True)
         except OSError as e:
-            print(f"  [api] schema dump failed: {e}", flush=True)
+            note_check_error("api", f"schema dump failed: {e}")
     print(f"  [api] -> {len(rows)} spec/graphql/dump hits", flush=True)
     return rows
 
@@ -11674,7 +11691,7 @@ async def ensure_nuclei():
             print(f"  [nuclei] fetching {url.rsplit('/', 1)[-1]} ...", flush=True)
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=600)) as r:
                 if r.status != 200:
-                    print(f"  [nuclei] download failed: HTTP {r.status}", flush=True)
+                    note_check_error("nuclei", f"download failed: HTTP {r.status}")
                     return None
                 data = await r.read()
         bindir = os.path.join(
@@ -11691,7 +11708,7 @@ async def ensure_nuclei():
                     print(f"  [nuclei] installed -> {dst}", flush=True)
                     return dst
     except Exception as e:
-        print(f"  [nuclei] install failed: {e}", flush=True)
+        note_check_error("nuclei", f"install failed: {e}")
     return None
 
 
@@ -11731,7 +11748,7 @@ async def nuclei_update_templates(binpath):
             return False
         return True
     except Exception as e:
-        print(f"  [nuclei] template update failed: {e}", flush=True)
+        note_check_error("nuclei", f"template update failed: {e}")
         return False
 
 
@@ -11813,7 +11830,7 @@ async def nuclei_scan(binpath, live, probes, findings, sevs, rate, timeout_s,
             print(f"  [nuclei] hard timeout after {timeout_s}s - "
                   f"keeping partial results", flush=True)
         except Exception as e:
-            print(f"  [nuclei] run failed: {e}", flush=True)
+            note_check_error("nuclei", f"run failed: {e}")
             return 0
         try:
             with open(efile, "rb") as ef:
@@ -12593,6 +12610,7 @@ async def dd_upload(a, domains, findings):
                 else:
                     print(f"[!] DefectDojo import -> {r.status}", flush=True)
     except Exception as e:
+        record_error("defectdojo", f"upload failed: {str(e)[:160]}")
         print(f"[!] DefectDojo upload failed: {str(e)[:160]}", flush=True)
 
 
@@ -12635,6 +12653,7 @@ async def jira_upload(a, findings):
         print(f"[+] Jira: {ok} issue(s) created in {a.jira_project}"
               + (f", {bad} failed" if bad else ""), flush=True)
     except Exception as e:
+        record_error("jira", f"upload failed: {str(e)[:160]}")
         print(f"[!] Jira upload failed: {str(e)[:160]}", flush=True)
 
 
@@ -12659,6 +12678,7 @@ async def send_webhook(url, payload, timeout=10):
                 print(f"[webhook] POST {url} -> {r.status} {body}", flush=True)
                 return r.status < 300
     except Exception as e:
+        record_error("webhook", f"POST {url} failed: {e}")
         print(f"[webhook] POST {url} failed: {e}", flush=True)
         return False
 
@@ -12876,8 +12896,9 @@ def _web_argv(targets, opts, auth="", cookie="", creds=(), cred_file="",
 
 def _web_stats():
     out = {"subs": 0, "endpoints": 0, "ports": 0, "dirs": 0, "vhosts": 0,
-           "findings": 0, "sev": {"critical": 0, "high": 0, "medium": 0,
-                                  "low": 0, "info": 0}}
+           "findings": 0, "errors": len(CHECK_ERRORS),
+           "sev": {"critical": 0, "high": 0, "medium": 0,
+                   "low": 0, "info": 0}}
     for k, fn in list(WEB_BUS.probes.items()):
         try:
             v = fn()
@@ -13009,6 +13030,7 @@ def _web_run_scan(argv):
     # asyncio.run loop raises "bound to a different event loop"
     DOH_SLOTS = [asyncio.Semaphore(DNS_PER_HOST) for _ in DOH]
     FAILS[0] = 0
+    CHECK_ERRORS.clear()
     old = sys.argv
     sys.argv = ["subenum.py"] + list(argv)
     code = 0
@@ -13499,6 +13521,7 @@ footer{text-align:center;color:#93a49d;font-size:12.5px;padding:26px 0 8px}
 </div>
 
 <script>
+const SE_TOKEN="__SE_TOKEN__";
 "use strict";
 const $=id=>document.getElementById(id);
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -13595,7 +13618,8 @@ function renderPhases(){
   $("elapsed").textContent=(s.elapsed||0)+"s";
 }
 const STAT_DEF=[["subs","Subdomains"],["endpoints","Endpoints"],["ports","Open ports"],
-  ["dirs","Dir hits"],["vhosts","Vhosts"],["findings","Findings"]];
+  ["dirs","Dir hits"],["vhosts","Vhosts"],["findings","Findings"],
+  ["errors","Check errors"]];
 function renderStats(){
   const s=st.stats||{};
   $("stats").innerHTML=STAT_DEF.map(([k,l])=>
@@ -13698,7 +13722,8 @@ function toggleEv(el,f){
     b.disabled=true;b.textContent="probing…";
     const out=d.querySelector(".evout");
     try{
-      const j=await(await fetch("/api/evidence?url="+encodeURIComponent(u))).json();
+      const j=await(await fetch("/api/evidence?url="+encodeURIComponent(u),
+        {headers:{"X-Subenum-Token":SE_TOKEN}})).json();
       out.hidden=false;
       if(!j.ok){out.textContent="error: "+(j.error||"failed");}
       else{
@@ -13739,7 +13764,8 @@ $("btnRefresh").onclick=()=>{fetchResults();};
 $("btnClrHist").onclick=async()=>{
   if(!confirm("delete saved scan history and old result files?"))return;
   try{
-    const j=await(await fetch("/api/clear",{method:"POST"})).json();
+    const j=await(await fetch("/api/clear",
+      {method:"POST",headers:{"X-Subenum-Token":SE_TOKEN}})).json();
     if(!j.ok){alert(j.error||"clear failed");return;}
   }catch(e){return;}
   $("histCard").hidden=true;$("histList").innerHTML="";
@@ -13778,7 +13804,8 @@ $("btnStart").onclick=async()=>{
   const bruteP=lines("#bruteP");
   const num=id=>{const v=parseInt($(id).value,10);return Number.isFinite(v)?v:0;};
   try{
-    const res=await fetch("/api/start",{method:"POST",headers:{"Content-Type":"application/json"},
+    const res=await fetch("/api/start",{method:"POST",
+      headers:{"Content-Type":"application/json","X-Subenum-Token":SE_TOKEN},
       body:JSON.stringify({targets:t,opts:optsFromUI(),profile:st.profile,
         authorization:$("authz").value.trim(),cookie:$("ck").value.trim(),
         creds:creds,brute_users:bruteU,brute_passes:bruteP,
@@ -13869,17 +13896,36 @@ boot();
 """
 
 
+_WEB_TOKEN = ""          # per-process session token for mutating /api routes
+
+
 def build_webapp(runner=None):
+    global _WEB_TOKEN
     _web_install_tee()
+    _WEB_TOKEN = secrets.token_urlsafe(16)
     if runner is not None:
         WEB_BUS.runner = runner
     if WEB_BUS.runner is None:
         WEB_BUS.runner = _web_run_scan
     WEB_BUS.active = True
-    app = web.Application()
+
+    @web.middleware
+    async def _token_mw(request, handler):
+        # side-effect routes need the per-process token: blocks cross-origin
+        # CSRF (a random page can POST /api/clear or fire blind scans) while
+        # same-origin UI fetches carry the token injected into index()
+        if request.path in ("/api/start", "/api/clear", "/api/evidence"):
+            if request.headers.get("X-Subenum-Token", "") != _WEB_TOKEN:
+                return web.json_response(
+                    {"ok": False,
+                     "error": "missing/invalid session token"}, status=403)
+        return await handler(request)
+
+    app = web.Application(middlewares=[_token_mw])
 
     async def index(request):
-        return web.Response(text=WEBUI_HTML, content_type="text/html")
+        return web.Response(text=WEBUI_HTML.replace("__SE_TOKEN__", _WEB_TOKEN),
+                            content_type="text/html")
 
     async def api_state(request):
         return web.json_response(_web_state())
@@ -14062,7 +14108,7 @@ def write_state(path, st):
             os.unlink(tmp)
         except OSError:
             pass
-        print(f"  [state] save failed: {e}", flush=True)
+        note_check_error("state", f"save failed: {e}")
 
 
 def parse_state(st, domains):
@@ -14129,6 +14175,7 @@ async def main():
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except (AttributeError, ValueError, OSError):
             pass
+    CHECK_ERRORS.clear()
     ap = argparse.ArgumentParser(
         add_help=True,
         description="subenum v9 - automated subdomain recon + active scanning "
@@ -14495,7 +14542,7 @@ async def main():
                 print(f"[*] resume from stage {start - 1} "
                       f"({len(live)} hosts, {len(findings)} findings)", flush=True)
         except Exception as e:
-            print(f"  [state] resume failed: {e}", flush=True)
+            note_check_error("state", f"resume failed: {e}")
 
     stop_flush = [False]
     flush_task = asyncio.create_task(
@@ -14540,7 +14587,7 @@ async def main():
                 st["surfinfo"] = surfinfo
             write_state(statefile, st)
         except Exception as e:
-            print(f"  [state] save failed: {e}", flush=True)
+            note_check_error("state", f"save failed: {e}")
 
     # ---------------- phases 1-3 ----------------
     if start <= 3:
@@ -14697,7 +14744,7 @@ async def main():
             res = await asyncio.gather(*tasks, return_exceptions=True)
             for k, r in zip(keys, res):
                 if isinstance(r, BaseException):
-                    print(f"  [{k}] failed: {r}", flush=True)
+                    note_check_error(k, f"failed: {r}")
                     continue
                 if k == "ports":
                     port_results = r
@@ -14813,7 +14860,7 @@ async def main():
             res = await asyncio.gather(*tasks2, return_exceptions=True)
             for k, r in zip(keys2, res):
                 if isinstance(r, BaseException):
-                    print(f"  [{k}] failed: {r}", flush=True)
+                    note_check_error(k, f"failed: {r}")
                     continue
                 if k == "dirs":
                     dir_rows = r
@@ -14893,14 +14940,14 @@ async def main():
                                       return_exceptions=True)
             for (k, _t), r in zip(allwave, rw):
                 if isinstance(r, BaseException):
-                    print(f"  [{k}] failed: {r}", flush=True)
+                    note_check_error(k, f"failed: {r}")
         if a.portscan and port_results:
             up_hosts = sorted({h for h, p, _b in port_results if p in (5672, 6379, 11211)})
             up_hosts = up_hosts or sorted(live_http)
             try:
                 await udp_service_checks(up_hosts, findings)
             except Exception as ue:
-                print(f"  [udp] failed: {ue}", flush=True)
+                note_check_error("udp", f"failed: {ue}")
 
     # endpoints (all_paths/attrib/crawl_rows) are assembled in the phase
     # 11-14 block above so waves 20-22 can consume them.
@@ -14993,7 +15040,7 @@ async def main():
         res2 = await asyncio.gather(*tasks2, return_exceptions=True)
         for k, r in zip(keys2, res2):
             if isinstance(r, BaseException):
-                print(f"  [{k}] failed: {r}", flush=True)
+                note_check_error(k, f"failed: {r}")
             elif k == "sweep" and r:
                 rows2, sw_names = r
                 port_results = sorted(set(port_results) | set(rows2))
@@ -15166,6 +15213,15 @@ async def main():
           f"{len(cve_list)} CVE/EOL  |  {len(cdn)} edge-mapped  |  "
           f"{n_email} emails / {n_phone} phones / {n_ip} internal IPs  |  "
           f"{time.time()-t0:.1f}s\n{'='*78}")
+    if CHECK_ERRORS:
+        seen_tags = sorted({t for t, _ in CHECK_ERRORS})
+        print(f"[!] {len(CHECK_ERRORS)} check error(s) in {len(seen_tags)} "
+              f"check(s): {', '.join(seen_tags)}", flush=True)
+        for t, m in CHECK_ERRORS[:10]:
+            print(f"  [{t}] {m}", flush=True)
+        if len(CHECK_ERRORS) > 10:
+            print(f"  ... and {len(CHECK_ERRORS) - 10} more "
+                  f"(see --web /api/stats errors count)", flush=True)
     for h in sorted(live):
         i = probes.get(h, {})
         tag = f"[{i.get('status','')}] " if i.get("status") else ""

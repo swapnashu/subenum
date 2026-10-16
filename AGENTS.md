@@ -17,18 +17,31 @@ dashboard (aiohttp, binds 127.0.0.1:80). Python 3.13, aiohttp only (plus dnspyth
    `cname.py`, `deep*.py`, `dnstls.py`, `methods.py`, `stack.py`, `vulcan_verify.py`.
 6. **Never publish** scan outputs (`subdomains*`), state (`.subenum_history.json`),
    tests/scratch, or the parallel tools — enforced by `.gitignore`.
+7. **Every check failure goes through `record_error()`/`note_check_error()`**
+   (next to `FAILS` at the top of subenum.py) — never a bare
+   `print(f"  [x] failed: ...")`. `CHECK_ERRORS` feeds the `/api/stats`
+   `errors` count, the end-of-scan summary, and the smoke gate.
+8. **Mutating dashboard routes need the session token**: any new route that
+   changes state (POSTs, plus `GET /api/evidence` which re-probes URLs) must
+   be listed in `_token_mw` inside `build_webapp()` and its JS fetch must
+   send `X-Subenum-Token` (`SE_TOKEN`, injected by `index()`); read-only
+   GETs stay open.
 
 ## Verification workflow (before declaring any change done)
-1. `python -m py_compile subenum.py`
+1. `python -m py_compile subenum.py` + `python -m ruff check subenum.py
+   --select E9,F63,F7,F82`
 2. `check_sev.py` (273/273) + `check_opts.py` (ALL OK)
 3. Affected `verify_waveNN.py` — live local mocks, expect `N ok, 0 FAIL`
-4. Full `battery_w12.bat` (runs all verifiers; **wave11 is manual**:
+4. Full `battery_w12.bat` (runs all verifiers + ruff; **wave11 is manual**:
    `python verify_wave11.py` → 89/0)
-5. `smoke_final.py` — real end-to-end; **rc must be 0 and there must be zero
-   `failed:` lines** in output (mocks can't catch everything — this is the gate)
+5. `smoke_final.py` — real end-to-end; **rc must be 0 and the gate enforces
+   zero `CHECK_ERRORS` and zero `failed:` lines** (any hit flips rc to 2 —
+   mocks can't catch everything; this is the gate)
 6. Restart dashboard: `cmd /c start "subenum" /min python subenum.py --web 80`
    (the `ChildProcess.kill` wrapper error is harmless), then hit `/`, `/api/stats`,
-   `/api/history` — all must be 200.
+   `/api/history` — all must be 200; `POST /api/clear` **without**
+   `X-Subenum-Token` must be 403, and `/` must contain a real token
+   (no `__SE_TOKEN__` placeholder left in the served HTML).
 
 Verifier scripts + battery live in `C:\Users\SATYA\AppData\Local\Temp\opencode\`
 (kept out of the repo; copy back from `tests/` if the dir is lost).
@@ -51,7 +64,8 @@ Verifier scripts + battery live in `C:\Users\SATYA\AppData\Local\Temp\opencode\`
 - `crawl_rows` is **tab-joined strings** `f"{h}\t{p}"` — consumers must
   `row.split("\t", 1)`, never tuple-unpack.
 - Never `await` a `StreamReader`/`StreamWriter` object (`wr.write(); await wr.drain()`).
-- `return_exceptions=True` hides failures → check console for `failed:` lines.
+- `return_exceptions=True` hides failures → they land in `CHECK_ERRORS`; the
+  smoke gate (rc=2) catches anything that slips past.
 - State JSON: probe bodies capped at 8 KB (`_BODY_CAP`).
 - Dedup via `class Findings` — append through it, not raw list.
 - `SUBENUM_NO_NUCLEI=1` set in some shells (skips nuclei); unset for full runs.
@@ -63,5 +77,6 @@ Verifier scripts + battery live in `C:\Users\SATYA\AppData\Local\Temp\opencode\`
 - Wait: `ping -n N 127.0.0.1 >nul`. PowerShell `->`/`$_` breaks in one-liners → temp `.ps1`.
 
 ## CI
-`.github/workflows/ci.yml`: py_compile + `--help` on ubuntu+windows; runs
+`.github/workflows/ci.yml`: py_compile + ruff (`E9,F63,F7,F82` only — the
+critical ruleset, not style) + `--help` on ubuntu+windows; runs
 `tests/unit*.py` only if present (tests are gitignored/local-only).
