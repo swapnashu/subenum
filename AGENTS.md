@@ -31,9 +31,11 @@ dashboard (aiohttp, binds 127.0.0.1:80). Python 3.13, aiohttp only (plus dnspyth
 1. `python -m py_compile subenum.py` + `python -m ruff check subenum.py
    --select E9,F63,F7,F82`
 2. `check_sev.py` (273/273) + `check_opts.py` (ALL OK)
-3. Affected `verify_waveNN.py` — live local mocks, expect `N ok, 0 FAIL`
-4. Full `battery_w12.bat` (runs all verifiers + ruff; **wave11 is manual**:
-   `python verify_wave11.py` → 89/0)
+3. Affected `verify_waveNN.py` — live local mocks, expect `N ok, 0 FAIL`;
+   `verify_golden.py` (precision ground truth: 10 cases, exact finding-set
+   on positive + exact-zero on deny, expect `24 ok, 0 FAIL`)
+4. Full `battery_w12.bat` (runs all verifiers + ruff + golden; **wave11 is
+   manual**: `python verify_wave11.py` → 89/0)
 5. `smoke_final.py` — real end-to-end; **rc must be 0 and the gate enforces
    zero `CHECK_ERRORS` and zero `failed:` lines** (any hit flips rc to 2 —
    mocks can't catch everything; this is the gate)
@@ -44,19 +46,27 @@ dashboard (aiohttp, binds 127.0.0.1:80). Python 3.13, aiohttp only (plus dnspyth
    (no `__SE_TOKEN__` placeholder left in the served HTML).
 
 Verifier scripts + battery live in `C:\Users\SATYA\AppData\Local\Temp\opencode\`
-(kept out of the repo; copy back from `tests/` if the dir is lost).
+(kept out of the repo). `D:\Subenum\tests\` is the **maintained local backup**
+(gitignored, never published) — re-copy the suite there after any verifier
+change so a temp-dir loss doesn't take the suite with it.
 
 ## Verifier conventions
 - One file per wave: `verify_waveNN.py`, unique mock port range per wave
-  (w20: 9064+, w21: 9201+, w22: 9301+, w23: 9401, w24: 9410+).
+  (w20: 9064+, w21: 9201+, w22: 9301+, w23: 9401, w24: 9410+, golden: 9501+).
 - Import functions directly from `subenum.py`; spin `aiohttp` mock servers that
   produce the exact evidence pattern; assert findings contain the tag; assert
   deny-phase (clean server) produces nothing.
 - **Mock contracts must match real protocol behavior**, not just our parser:
   aiohttp's server rejects TRACK/DEBUG → use raw `asyncio.start_server` TCP mocks
-  for those verbs.
+  for those verbs. Hidden contracts that bit the golden harness: TRACE marker
+  header is `X-Sxe-Trace`; ratelimit baseline path is `/sxnrl-<rng>/login`
+  (must 404, else catch-all suppression); backup canary is `/sxnbf-<rng>.bak`
+  (must return the same fake body as candidates, else similarity never trips);
+  session-fixation rotation is "Set-Cookie echoes the client-supplied value".
 - Reuse **one `aiohttp.TCPConnector` per sequential batch** (`fresh_conn()`);
-  sharing one across sequential checks breaks later checks.
+  an aiohttp session OWNS and CLOSES its connector on exit — a connector
+  shared past the first `async with xsession(conn)` is dead (all later checks
+  silently score 0).
 - Parse HTTP headers **case-insensitively** — aiohttp returns a plain dict and
   `.get("allow")` misses server-cased `Allow`.
 
