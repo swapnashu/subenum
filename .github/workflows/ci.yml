@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: install deps
+        run: pip install -r requirements.txt
+      - name: syntax + smoke
+        env:
+          SUBENUM_NO_NUCLEI: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile subenum.py
+          python subenum.py --help
+      - name: unit suites (optional)
+        shell: bash
+        run: |
+          shopt -s nullglob || true
+          tests=(tests/unit*.py)
+          if [ ${#tests[@]} -eq 0 ]; then
+            echo "no unit tests present, skipping"
+            exit 0
+          fi
+          for t in "${tests[@]}"; do
+            echo "::group::${t}"
+            python -u "$t"
+            echo "::endgroup::"
+          done

@@ -1,0 +1,28 @@
+# scan outputs - target data, never publish
+subdomains*
+.subenum_history.json
+ERR
+*.log
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# local-only tests & scratch (not published)
+tests/
+scratch/
+
+# parallel local tools (not part of subenum repo)
+authflow.py
+bugaudit.py
+cname.py
+deep.py
+deep2.py
+deep3.py
+dnstls.py
+methods.py
+stack.py
+vulcan_verify.py
