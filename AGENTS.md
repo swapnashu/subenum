@@ -30,7 +30,7 @@ dashboard (aiohttp, binds 127.0.0.1:80). Python 3.13, aiohttp only (plus dnspyth
 ## Verification workflow (before declaring any change done)
 1. `python -m py_compile subenum.py` + `python -m ruff check subenum.py
    --select E9,F63,F7,F82`
-2. `check_sev.py` (273/273) + `check_opts.py` (ALL OK)
+2. `check_sev.py` (275/275) + `check_opts.py` (ALL OK)
 3. Affected `verify_waveNN.py` — live local mocks, expect `N ok, 0 FAIL`;
    `verify_golden.py` (precision ground truth: 10 cases, exact finding-set
    on positive + exact-zero on deny, expect `24 ok, 0 FAIL`)
@@ -52,7 +52,8 @@ change so a temp-dir loss doesn't take the suite with it.
 
 ## Verifier conventions
 - One file per wave: `verify_waveNN.py`, unique mock port range per wave
-  (w20: 9064+, w21: 9201+, w22: 9301+, w23: 9401, w24: 9410+, golden: 9501+).
+  (w20: 9064+, w21: 9201+, w22: 9301+, w23: 9401, w24: 9410+, w25: 9550+,
+  golden: 9501+).
 - Import functions directly from `subenum.py`; spin `aiohttp` mock servers that
   produce the exact evidence pattern; assert findings contain the tag; assert
   deny-phase (clean server) produces nothing.
@@ -79,6 +80,9 @@ change so a temp-dir loss doesn't take the suite with it.
 - State JSON: probe bodies capped at 8 KB (`_BODY_CAP`).
 - Dedup via `class Findings` — append through it, not raw list.
 - `SUBENUM_NO_NUCLEI=1` set in some shells (skips nuclei); unset for full runs.
+- An aiohttp `web.Response` payload is **single-use** — mock handlers must
+  build a fresh `Response` per request, never reuse one shared instance
+  (later requests silently 500 and baseline fetches come back empty).
 
 ## Shell quirks (Windows cmd)
 - Multi-line `python -c` hangs → write a temp `.py` file and run it.
@@ -88,5 +92,6 @@ change so a temp-dir loss doesn't take the suite with it.
 
 ## CI
 `.github/workflows/ci.yml`: py_compile + ruff (`E9,F63,F7,F82` only — the
-critical ruleset, not style) + `--help` on ubuntu+windows; runs
+critical ruleset, not style) + an **ast-parsed SEV/REMED gate** (orphan tags
+or bad severity values fail the build) + `--help` on ubuntu+windows; runs
 `tests/unit*.py` only if present (tests are gitignored/local-only).

@@ -29,6 +29,27 @@ jobs:
           python -m py_compile subenum.py
           pip install ruff
           python -m ruff check subenum.py --select E9,F63,F7,F82
+          python - <<'PY'
+          import ast, sys
+          tree = ast.parse(open("subenum.py", encoding="utf-8").read())
+          sev = rem = None
+          for node in tree.body:
+              if isinstance(node, ast.Assign):
+                  for t in node.targets:
+                      if isinstance(t, ast.Name) and t.id == "SEV":
+                          sev = ast.literal_eval(node.value)
+                      if isinstance(t, ast.Name) and t.id == "REMEDIATION":
+                          rem = ast.literal_eval(node.value)
+          if not sev or not rem:
+              sys.exit("SEV/REMEDIATION dicts not found")
+          missing = sorted(set(sev) - set(rem))
+          extra = sorted(set(rem) - set(sev))
+          bad = [v for v in sev.values()
+                 if v not in ("critical", "high", "medium", "low", "info")]
+          print(f"SEV {len(sev)} REMED {len(rem)}")
+          if missing or extra or bad:
+              sys.exit(f"orphan sev={missing} orphan rem={extra} bad sev={bad}")
+          PY
           python subenum.py --help
       - name: unit suites (optional)
         shell: bash

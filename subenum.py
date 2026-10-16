@@ -592,7 +592,9 @@ SEV = {"PORT-RISK": "critical", "TAKEOVER-CONFIRMED": "critical", "LEAK": "criti
           # ---- wave 24: HTTP method expansion ----
           "TRACK": "medium", "DEBUG-METHOD": "medium",
           "SEARCH-ALLOWED": "medium", "MKCOL-ALLOWED": "high",
-          "MOVE-ALLOWED": "high", "CONNECT-PROXY": "high"}
+          "MOVE-ALLOWED": "high", "CONNECT-PROXY": "high",
+          # ---- wave 25: AI/LLM API surface ----
+          "LLM-ENDPOINT": "info", "LLM-OPEN": "medium"}
 
 # methods that should never be advertised on a hardened origin (wave 24)
 DANGEROUS_METHODS = ("PUT", "DELETE", "PATCH", "TRACE", "TRACK", "DEBUG",
@@ -910,6 +912,8 @@ SPEC_PATHS = ["/swagger.json", "/openapi.json", "/openapi.yaml", "/v2/api-docs",
               "/api-docs", "/api/docs", "/redoc", "/docs", "/openapi", "/swagger",
               "/.well-known/openapi.json"]
 GQL_PATHS = ["/graphql", "/api/graphql", "/v1/graphql", "/gql", "/graphiql"]
+LLM_MODEL_PATHS = ("/v1/models", "/api/v1/models")
+LLM_COMPLETION = "/v1/chat/completions"
 
 # ---------------- phase 15: surface + CVE ----------------
 EMAIL_RE = re.compile(rb"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]{1,80}"
@@ -8006,6 +8010,121 @@ async def api_spec(probes, findings, cap_hosts=150, schema_out=""):
     return rows
 
 
+# ---------------- wave 25: AI/LLM API surface ----------------
+async def llm_surface_checks(probes, findings, cap_hosts=60):
+    """prove an OpenAI-compatible API by response SHAPE, never by path:
+    a model list needs object=list + data[].object=model records, an
+    auth-gated claim needs an api-key error body, and unauthenticated
+    inference (LLM-OPEN) needs a successful completion carrying usage
+    tokens with a non-echo reply - a random-path baseline drops SPA /
+    catch-all JSON servers, and a failed baseline claims nothing."""
+    rows = []
+    targets = [h for h in sorted(probes) if probes[h].get("status")][:cap_hosts]
+    if not targets:
+        return rows
+    prompt = "Reply with the single word OK only."
+    pbytes = json.dumps({"model": "probe", "messages": [
+        {"role": "user", "content": prompt}]}).encode()
+    conn = aiohttp.TCPConnector(limit=0, ssl=False)
+    async with tsession(conn) as s:
+        async def one(h):
+            base = _burl(probes, h)
+            bl_body, bl_checked = None, False
+
+            async def baseline(body):
+                nonlocal bl_checked, bl_body
+                if not bl_checked:
+                    bl_checked = True
+                    _bst, bl_body, _ = await _grab(
+                        s, f"{base}/sxe-nollm-{os.urandom(4).hex()}",
+                        timeout=6, limit=20000)
+                    if not bl_body:
+                        _bst, bl_body, _ = await _grab(
+                            s, f"{base}/sxe-nollm-{os.urandom(4).hex()}",
+                            timeout=6, limit=20000)
+                if not bl_body:
+                    return False    # no baseline: never claim
+                return not _body_similar(bl_body, body)
+
+            claimed = False
+            for p in LLM_MODEL_PATHS:
+                st, body, _ = await _grab(s, f"{base}{p}", timeout=6,
+                                          limit=20000)
+                if st != 200 or not body:
+                    continue
+                try:
+                    j = json.loads(body)
+                except Exception:
+                    continue
+                if not (isinstance(j, dict) and j.get("object") == "list"
+                        and isinstance(j.get("data"), list) and j["data"]
+                        and isinstance(j["data"][0], dict)
+                        and j["data"][0].get("object") == "model"
+                        and j["data"][0].get("id")):
+                    continue
+                if not await baseline(body):
+                    continue
+                ids = [str(m.get("id")) for m in j["data"][:3]
+                       if isinstance(m, dict) and m.get("id")]
+                findings.append(f"[LLM-ENDPOINT] {h}{p} serves an "
+                                f"OpenAI-compatible model list ({st}, "
+                                f"{len(body)}B: {', '.join(ids)})")
+                rows.append(f"{h}\t{p}\tllm-models\t{st}\t{len(body)}")
+                claimed = True
+            st, body, _ = await _grab(s, f"{base}{LLM_COMPLETION}",
+                                      method="POST", data=pbytes,
+                                      headers={"Content-Type":
+                                               "application/json"},
+                                      timeout=8, limit=20000)
+            if st in (200, 401, 403) and body and await baseline(body):
+                try:
+                    j = json.loads(body)
+                except Exception:
+                    j = None
+                if (isinstance(j, dict) and st == 200
+                        and isinstance(j.get("choices"), list)
+                        and j["choices"] and isinstance(j["choices"][0], dict)
+                        and isinstance(j["choices"][0].get("message"), dict)
+                        and isinstance(j["choices"][0]["message"].get("content"),
+                                       str)):
+                    content = j["choices"][0]["message"]["content"].strip()
+                    usage = (j.get("usage") if isinstance(j.get("usage"), dict)
+                             else {})
+                    toks = usage.get("total_tokens") or 0
+                    try:
+                        toks = int(toks)
+                    except Exception:
+                        toks = 0
+                    if content and toks > 0 and content != prompt:
+                        findings.append(
+                            f"[LLM-OPEN] {h}{LLM_COMPLETION} accepted an "
+                            f"unauthenticated completion ({st}, {len(body)}B, "
+                            f"{toks} usage tokens, non-echo reply) - "
+                            f"inference without any auth")
+                        rows.append(f"{h}\t{LLM_COMPLETION}\tllm-open\t{st}\t"
+                                    f"{len(body)}")
+                        claimed = True
+                elif (not claimed and st in (401, 403)
+                      and isinstance(j, dict) and "error" in j
+                      and any(k in body.lower() for k in (
+                          b"api_key", b"apikey", b"authentication",
+                          b"unauthorized", b"openai"))):
+                    findings.append(f"[LLM-ENDPOINT] {h}{LLM_COMPLETION} is "
+                                    f"an AI inference API ({st}: api-key "
+                                    f"error, {len(body)}B)")
+                    rows.append(f"{h}\t{LLM_COMPLETION}\tllm-gated\t{st}\t"
+                                f"{len(body)}")
+                    claimed = True
+        res = await asyncio.gather(*(one(h) for h in targets),
+                                   return_exceptions=True)
+        errs = [r for r in res if isinstance(r, BaseException)]
+        if errs:
+            note_check_error("llm", f"{len(errs)} host(s) failed, "
+                             f"first: {errs[0]!r}")
+    print(f"  [llm] -> {len(rows)} AI endpoint hits", flush=True)
+    return rows
+
+
 # ---------------- phase 14: method matrix ----------------
 async def method_matrix(probes, findings, cap_hosts=80):
     rows = []
@@ -12344,6 +12463,8 @@ REMEDIATION = {
     "MKCOL-ALLOWED": "WebDAV MKCOL creates collections unauthenticated (write-class foothold) - disable MKCOL/PUT/MOVE at the edge or require authentication + authorization",
     "MOVE-ALLOWED": "WebDAV MOVE renames resources unauthenticated - disable MOVE/COPY at the edge or require authentication + per-resource authorization",
     "CONNECT-PROXY": "the server accepts CONNECT and will tunnel arbitrary destinations (open proxy) - block CONNECT at the reverse proxy except for explicitly trusted upstreams",
+    "LLM-ENDPOINT": "an OpenAI-compatible inference API is reachable - require authentication (API keys), network-restrict the endpoint and keep it behind the gateway",
+    "LLM-OPEN": "the model accepts unauthenticated completions (cost/abuse/data-leak risk) - enforce API-key auth + rate limits on /v1/chat/completions and audit usage",
 }
 
 
@@ -14851,11 +14972,13 @@ async def main():
         if a.api and live_http:
             tasks2.append(api_spec(probes, findings, schema_out=base + "_graphql.txt"))
             keys2.append("api")
+            tasks2.append(llm_surface_checks(probes, findings))
+            keys2.append("llm")
         if a.methods and live_http:
             tasks2.append(method_matrix(probes, findings))
             keys2.append("methods")
         if tasks2:
-            print(f"[11-14/19] dirs | vhost | api-spec | methods "
+            print(f"[11-14/19] dirs | vhost | api-spec | llm | methods "
                   f"({len(live_http)} hosts) ...", flush=True)
             res = await asyncio.gather(*tasks2, return_exceptions=True)
             for k, r in zip(keys2, res):
@@ -14868,6 +14991,8 @@ async def main():
                     vhost_rows = r
                 elif k == "api":
                     api_rows = r
+                elif k == "llm":
+                    llm_rows = r
                 else:
                     method_rows = r
         else:
@@ -15251,13 +15376,23 @@ async def main():
              if a.api and os.path.exists(base + "_graphql.txt") else ""))
     hook = a.webhook or os.environ.get("SUBENUM_WEBHOOK", "")
     if hook:
+        # delta rides along when a baseline was supplied so receivers can
+        # alert on NEW findings/hosts only - lists capped, totals exact
+        delta = ({"new_hosts": d["new_hosts"][:50],
+                  "new_findings": d["new_findings"][:50],
+                  "gone_hosts": d["gone_hosts"][:20],
+                  "gone_findings": d["gone_findings"][:20],
+                  "new_hosts_total": len(d["new_hosts"]),
+                  "new_findings_total": len(d["new_findings"])}
+                 if old_run is not None else None)
         await send_webhook(hook, {
-            "tool": "subenum", "version": 9, "targets": domains,
+            "tool": "subenum", "version": 10, "targets": domains,
             "hosts": len(live), "findings": len(fs),
             "severity": {s: cnt.get(s, 0) for s in
                          ("critical", "high", "medium", "low", "info")},
             "critical_high": [x for x in fs
                               if sev(x) in ("critical", "high")][:50],
+            "delta": delta,
             "endpoints": len(all_paths), "open_ports": len(port_results),
             "elapsed": round(time.time() - t0, 1),
             "files": {"json": jsonfile,
