@@ -1,159 +1,4 @@
 #!/usr/bin/env python3
-"""
-subenum.py v9 - aggressive subdomain recon engine (19 phases, active scanning,
-fully automated: no arguments -> browser dashboard -> enter target -> go)
-
-usage:
-  python subenum.py                        (browser dashboard auto-opens: enter
-                                            the target in the UI, watch progress)
-  python subenum.py --cli                  (interactive console prompt instead)
-  echo example.com | python subenum.py     (scripted: target on stdin, full auto)
-  python subenum.py magicpin.in,magicpin.com
-  python subenum.py magicpin.in --nobrute --crawl 30
-  python subenum.py --targets magicpin.in --wl wordlist.txt --max 50000
-  python subenum.py example.com --resume          (continue interrupted run)
-  python subenum.py example.com --fail-on high    (exit code 2 for CI gating)
-  python subenum.py example.com --sarif --junit   (CI exports for scanning gates)
-  python subenum.py example.com --csv             (findings as severity,finding CSV)
-  python subenum.py example.com --delta           (diff vs last run's JSON)
-  python subenum.py app.com --cookie "sid=abc" --authorization "Bearer eyJ..." (--header "X-Key: v")
-  python subenum.py app.com --cookie-file cookies.txt   (name=value or Netscape export)
-  python subenum.py app.com --cookie "sid=a" --auth-b "Cookie: sid=b"  (IDOR matrix)
-  python subenum.py example.com --proxy http://127.0.0.1:8080  (all HTTP via proxy)
-  python subenum.py example.com --resolver system --nameservers 1.1.1.1,8.8.8.8
-  python subenum.py example.com --no-reverse --ptr-budget 8000 --dns-conc 500
-  python subenum.py example.com --no-nuclei --nuclei-sev critical,high --sweep-ips 128
-  python subenum.py --web                (dashboard on port 80 -> http://subenum;
-                                          falls back to 8080+ if 80 is taken)
-  python subenum.py --web 9000           (dashboard on 127.0.0.1:9000)
-
-interactive profiles:
-  full   (Enter) all 19 phases, advanced budgets - the default "just go" mode
-  quick  DNS verify + probe + ports + takeover + CVE only (minutes)
-  custom y/n for each check group (brute / discovery / active / nuclei / crawl)
-
-env keys (optional, add passive sources): PD_API_KEY (projectdiscovery chaos),
-  ST_API_KEY (securitytrails), VT_API_KEY (virustotal), SHODAN_KEY (shodan dns)
-
-rate limiting (automatic): every HTTP response feeds a per-host (host:port)
-  tracker - 429/503 honours Retry-After (else exponential backoff, cap 120s),
-  healthy traffic decays the delay, WAF fingerprints seed a 0.15s/host pacing
-  floor; backoff frees its global slot so one throttled host cannot stall others
-
-phases (automatic, each toggleable; 6/7/8 and 11/12/13 run in parallel):
-  1  passive OSINT    crt.sh, hackertarget, wayback, subdomain.center, certspotter,
-                      urlscan, alienvault OTX, mnemonic pdns, rapiddns, common crawl,
-                      anubis (jldc), threatminer, bufferover
-                      + key-gated chaos / securitytrails / virustotal / shodan
-  2  DoH brute        Google+Cloudflare + label permutations (dev-/qa/-v2 style)
-  3  verify           wildcard-zone detection (DNS + HTTP baseline fingerprint) +
-                      automatic retry pass; brute-only hits under a wildcard zone are
-                      content-compared after probing, not blanket-dropped
-  4  dns + tls        CNAME chains, apex NS/MX/TXT/SPF/DMARC/SRV -> subdomain harvest,
-                      AXFR zone-transfer attempt, TLS certs -> SAN harvest,
-                      expired/invalid cert detection, dangling-CNAME detection
-  4b reverse+netblock PTR harvest for every live IP, /24 sweeps around them,
-                      RIPEstat org-netblock sampling, reverse-IP lookups -> new names
-  5  http probe       status/title/server/tech/security headers/takeover fingerprints,
-                      login-form clickjacking + root directory-listing detection,
-                      mixed-content, login-CSRF token presence, OAuth state,
-                      sensitive HTML-comment leaks, third-party script SRI check,
-                      Permissions-Policy header, plaintext login-form and
-                      HTTP-Basic-over-http challenge detection,
-                      IIS 8.3 shortname disclosure,
-                      wildcard content filtering runs against these results
-  6  deep crawl       BFS same-host crawl + endpoint/secret mining + cookie/CORS/method checks
-  7  port scan        async TCP connect + banner grab + anonymous FTP login +
-                      unauthenticated service probes (docker/elastic/redis/
-                      memcached/etcd/rsync) (parallel with 6 and 8)
-  8  endpoints        wayback harvest (parallel with 6 and 7)
-  9  secrets          live pages + crawled JS + archived wayback JS + source maps
-                      + sensitive file leaks + robots.txt hidden-path
-                      disclosure + .DS_Store entry parsing
-                      + static client-side bug scan (DOM-XSS source->sink flow,
-                      postMessage handlers without event.origin validation)
-  10 takeover         confirm dangling CNAMEs against HTTP fingerprints
-  11 content discovery dir/file brute w/ soft-404 baseline -> hidden panels & files,
-                      directory-listing detection, 403 path-variant bypass checks
-  12 vhost brute      Host-header wordlist vs shared IPs -> default-vhost leaks
-  13 api spec         swagger/openapi harvest + GraphQL introspection (read-only query)
-  14 method matrix    OPTIONS/TRACE/PROPFIND on live targets
-  15 surface + CVE    emails/phones/internal-ips/params harvest, banner+JS-lib CVE match,
-                      EOL software, WAF/CDN edge map, CAA (issue-value
-                      checked) + MTA-STS DNS hardening incl. the
-                      mta-sts.<domain> policy-file fetch (mode: enforce),
-                      DNSSEC NSEC zone-walk
-  --- active scanning -------------------------------------------------------
-  16 params           DAST-lite: open-redirect (+ //, /\\, \\/ bypass payloads)
-                      / reflected XSS (context + double/single-quote breakout
-                      proof) / SSTI (engine fingerprint + RCE exploit + User-Agent,
-                      Cookie, Referer header channels) / SQLi (error,
-                      boolean-blind, time-blind + error-based version/db/user
-                      extraction, extractvalue + FLOOR(RAND)) / NoSQLi / XPath /
-                      LDAP injection / OS command injection / SSI / shellshock
-                      / CRLF header
-                      injection / JSONP callback / prototype pollution / XXE
-                      (POST entity expansion + file read) / GraphQL batching /
-                      host header injection / auth-bypass edge header tricks /
-                      SSRF / path traversal (+ win.ini, .env, WEB-INF/web.xml,
-                      php://filter source leak) + verbose stack-trace
-                      disclosure, backup source files (.bak/.old/~/.swp),
-                      missing rate limits on auth endpoints, default Basic
-                      credentials, cross-site websocket hijacking (CSWSH),
-                      method-override header honoring, javascript:/data:
-                      redirect schemes and secrets transmitted in query
-                      strings - evidence-based probes
-                      + SMTP VRFY/RCPT mailbox enumeration (uniform server
-                      replies produce no finding - only a control-vs-candidate
-                      differential counts)
-                      + unauthenticated canary PUT/DELETE write checks
-                      (PUT must persist and GET-verify; DELETE must show
-                      verified removal - no resource is ever touched)
-                      + login username enumeration (two random users must be
-                      stable first; a differing candidate proves disclosure)
-                      / HTTP Parameter Pollution (both duplicate canaries
-                      reflected) / email header injection (control must
-                      reflect before an injected Bcc counts)
-                      + unauthenticated sequential-object IDOR (neighbor id
-                      readable with a differing body, control id rejected)
-                      / OAuth redirect_uri allowlist canary (3xx Location
-                      to the external host) / time-based ReDoS (both evil
-                      runs slow vs a fast control) / open-relay + STARTTLS
-                      health on the primary MX (SMTP; RSET/QUIT only, no
-                      DATA is ever sent)
-  17 tls config       TLS1.0/1.1 support, weak cipher suites, static-RSA key
-                      exchange (ROBOT surface), RSA key size, MD5/SHA1 cert sigs
-  18 netblock sweep   port-scan + banner + PTR on IPs inside org-owned netblocks
-                      (non-cloud ASNs only) -> shared-infra mapping + new names
-  19 nuclei           projectdiscovery nuclei engine (auto-downloads binary +
-                      templates on first use) -> CVE/template findings by severity
-
-outputs:
-  subdomains.txt / _links / _endpoints / _crawl / _ports / _dirs / _vhosts /
-  _surface / _findings / .json
-  subdomains_report.html    severity-grouped + per-host HTML report, per-tag
-                            remediation hints, by-type summary table
-  subdomains.state.json     checkpoint, saved after phases 3/5/15 (used with --resume)
-  subdomains.sarif          (--sarif) SARIF 2.1.0 for GitHub code scanning
-  subdomains_junit.xml      (--junit) JUnit XML for CI test gates
-  subdomains.csv            (--csv) findings as severity,finding CSV
-  .subenum_history.json     (web dashboard) last 20 finished scans - browse,
-                            re-open and export them from the Recent scans list
-  subdomains_diff.txt       (--baseline OLD.json / --delta) +new/-resolved
-                            hosts and findings since the baseline run
-  webhook JSON              (--webhook URL) POST {severity counts,
-                            critical_high[], files{}} after the run
-
-json schema (schema_version 1; keys are additive-only, never renamed/removed):
-  schema_version int   targets [str]        elapsed float    count int
-  hosts [{host, ip, cname, scheme, status, title, tech, ...}]
-  apex_records {}      findings [str]       severity {sev: int}   endpoints int
-  crawl_pairs int      mined int            ports [{host, port, banner}]
-  dangling {}          certs {}             dir_hits / vhost_hits / api_hits /
-                                             method_hits int (hit counts)
-  cves [str]           cdn {host: [tag]}    surface {emails, phones,
-                                             internal_ips, sens_params}
-"""
 import asyncio, aiohttp, re, sys, time, os, argparse, json, base64, ssl, html, ipaddress, hmac, hashlib, struct, secrets
 import shutil, zipfile, platform, socket, subprocess, tempfile, io, random, gzip, glob
 import xml.etree.ElementTree as ET
@@ -12804,6 +12649,118 @@ async def send_webhook(url, payload, timeout=10):
         return False
 
 
+# ---------------- opt-in AI triage (SUBENUM_LLM_URL / _KEY / _MODEL) ----------
+AI_PREF = ("opencode/deepseek-v4.1-flash-free",
+           "qwen/qwen3.8-max:free", "qwen/qwen3.7-max:free",
+           "qwen/qwen3-max:free", "qwen/qwen3-coder-plus:free",
+           "deepseek-v4.1-flash-free", "qwen3.8-max:free")
+
+
+def _llm_models_url(chat_url):
+    u = str(chat_url).strip()
+    if u.endswith("/chat/completions"):
+        return u[: -len("/chat/completions")] + "/models"
+    return ""
+
+
+async def ai_pick_model(url, key="", timeout=15):
+    """best available model id from the endpoint's /models list; None on failure."""
+    mu = _llm_models_url(url)
+    if not mu:
+        return None
+    try:
+        async with xsession() as s:
+            hdrs = {"Authorization": f"Bearer {key}"} if key else {}
+            async with s.get(mu, headers=hdrs,
+                             timeout=aiohttp.ClientTimeout(total=timeout)) as r:
+                if r.status != 200:
+                    return None
+                j = await r.json(content_type=None)
+    except Exception:
+        return None
+    ids = ([str(m.get("id")) for m in (j.get("data") or [])
+            if isinstance(m, dict) and m.get("id")]
+           if isinstance(j, dict) else [])
+    if not ids:
+        return None
+    for m in AI_PREF:
+        if m in ids:
+            return m
+    for m in ids:
+        if m.endswith(":free") and "max" in m:
+            return m
+    for m in ids:
+        if m.endswith(":free") and "plus" in m:
+            return m
+    for m in ids:
+        if m.endswith(":free"):
+            return m
+    return ids[0]
+
+
+async def ai_triage(fs, live, url, key="", model="",
+                    timeout=75, max_attempts=3):
+    """opt-in AI triage: POST a capped findings digest to an OpenAI-compatible
+    endpoint (SUBENUM_LLM_URL / SUBENUM_LLM_KEY / SUBENUM_LLM_MODEL, default
+    model opencode/deepseek-v4.1-flash-free) and return the model's plain-text
+    prioritized summary. Tries the configured model first, then auto-selects
+    the best available one (ai_pick_model + preference ladder); any failure
+    records a check error and returns "". The key is only ever sent to the
+    configured URL, never to scan targets."""
+    try:
+        top = sorted(fs, key=lambda x: (
+            {"critical": 0, "high": 1, "medium": 2, "low": 3}.get(sev(x), 4),
+            x))[:40]
+        ccnt = Counter(sev(x) for x in fs)
+        sevline = ", ".join(f"{s}={ccnt[s]}" for s in
+                            ("critical", "high", "medium", "low", "info")
+                            if ccnt.get(s))
+        digest = (f"live hosts: {len(live)} | findings: {len(fs)} "
+                  f"({sevline})\nfindings:\n"
+                  + "\n".join(f"[{sev(x)}] {x[:280]}" for x in top))
+        prompt = ("You are a recon triage analyst. Given the digest below, "
+                  "reply in plain text with: (1) top 3 risks in priority "
+                  "order, one line each; (2) one quick win; (3) one "
+                  "recommended next check. Max 120 words.\n\n" + digest)
+        cands = []
+        if model:
+            cands.append(model)
+        picked = await ai_pick_model(url, key)
+        if picked and picked not in cands:
+            cands.append(picked)
+        for m in AI_PREF:
+            if m not in cands:
+                cands.append(m)
+        cands = cands[:max_attempts]
+        hdrs = {"Content-Type": "application/json"}
+        if key:
+            hdrs["Authorization"] = f"Bearer {key}"
+        async with xsession() as s:
+            for m in cands:
+                payload = {"model": m, "messages": [
+                    {"role": "user", "content": prompt}]}
+                try:
+                    async with s.post(url, json=payload, headers=hdrs,
+                                      timeout=aiohttp.ClientTimeout(
+                                          total=timeout)) as r:
+                        if r.status != 200:
+                            continue
+                        j = json.loads(await r.text())
+                        ch = j.get("choices") if isinstance(j, dict) else None
+                        c = (ch[0].get("message", {}).get("content", "")
+                             if ch and isinstance(ch[0], dict) else "")
+                        if c:
+                            return c.strip()[:2000]
+                except Exception:
+                    continue
+        record_error("ai", f"no candidate model produced a reply "
+                           f"({len(cands)} tried)")
+        return ""
+    except Exception as e:
+        record_error("ai", f"triage failed: {e}")
+        return ""
+
+
 # ---------------- web UI: local dashboard (targets in browser, live progress, results) ----------
 import threading
 
@@ -15347,6 +15304,17 @@ async def main():
         if len(CHECK_ERRORS) > 10:
             print(f"  ... and {len(CHECK_ERRORS) - 10} more "
                   f"(see --web /api/stats errors count)", flush=True)
+    ai_txt = ""
+    llm_url = os.environ.get("SUBENUM_LLM_URL", "").strip()
+    if llm_url and fs:
+        print("[ai] triage ...", flush=True)
+        ai_txt = await ai_triage(
+            fs, live, llm_url,
+            os.environ.get("SUBENUM_LLM_KEY", "").strip(),
+            os.environ.get("SUBENUM_LLM_MODEL", "").strip()
+            or "opencode/deepseek-v4.1-flash-free")
+        if ai_txt:
+            print(f"\n--- AI TRIAGE ---\n{ai_txt}", flush=True)
     for h in sorted(live):
         i = probes.get(h, {})
         tag = f"[{i.get('status','')}] " if i.get("status") else ""
@@ -15386,13 +15354,14 @@ async def main():
                   "new_findings_total": len(d["new_findings"])}
                  if old_run is not None else None)
         await send_webhook(hook, {
-            "tool": "subenum", "version": 10, "targets": domains,
+            "tool": "subenum", "version": 11, "targets": domains,
             "hosts": len(live), "findings": len(fs),
             "severity": {s: cnt.get(s, 0) for s in
                          ("critical", "high", "medium", "low", "info")},
             "critical_high": [x for x in fs
                               if sev(x) in ("critical", "high")][:50],
             "delta": delta,
+            "ai_summary": ai_txt or None,
             "endpoints": len(all_paths), "open_ports": len(port_results),
             "elapsed": round(time.time() - t0, 1),
             "files": {"json": jsonfile,

@@ -80,6 +80,12 @@ change so a temp-dir loss doesn't take the suite with it.
 - State JSON: probe bodies capped at 8 KB (`_BODY_CAP`).
 - Dedup via `class Findings` — append through it, not raw list.
 - `SUBENUM_NO_NUCLEI=1` set in some shells (skips nuclei); unset for full runs.
+- **AI triage is env-gated, no CLI flag**: set `SUBENUM_LLM_URL` (OpenAI-compatible
+  chat URL, e.g. `https://host/opencode.php/v1/chat/completions`),
+  `SUBENUM_LLM_KEY`, optional `SUBENUM_LLM_MODEL` (default
+  `opencode/deepseek-v4.1-flash-free`). Auto-selects the best model from the
+  endpoint's `/models` list when the configured one fails; failures land in
+  `CHECK_ERRORS` as tag `ai`. The key is only ever sent to `SUBENUM_LLM_URL`.
 - An aiohttp `web.Response` payload is **single-use** — mock handlers must
   build a fresh `Response` per request, never reuse one shared instance
   (later requests silently 500 and baseline fetches come back empty).
