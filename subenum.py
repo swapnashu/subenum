@@ -13614,7 +13614,7 @@ const OPTS=[["brute","DNS brute"],["wayback","Wayback paths"],["ports","Port sca
   ["axfr","Zone transfer"],["userenum","SMTP user enum"],["putdel","PUT/DELETE"],
   ["smtp","SMTP relay"],["mailsec","Mail security"],["nsecwalk","NSEC walk"]];
 const st={state:null,stats:{sev:{}},results:null,profile:"full",cursor:0,runKey:null,
-  rawlines:[],es:null,forcedLaunch:0};
+   rawlines:[],es:null,forcedLaunch:0,lastSse:0};
 
 $("opts").innerHTML=OPTS.map(([k,l])=>
   `<label class="opt"><input type="checkbox" checked data-k="${k}"> ${l}</label>`).join("");
@@ -13906,6 +13906,7 @@ function connect(){
   try{
     const es=new EventSource("/events"); st.es=es;
     es.onmessage=ev=>{
+      st.lastSse=Date.now();
       let j;try{j=JSON.parse(ev.data);}catch(e){return;}
       if(j.t==="snapshot"){
         onState(j.state);                      // may wipe console (new run)
@@ -13936,7 +13937,8 @@ function connect(){
       onState(j.state);                        // detects a new run first
       const changed=st.runKey!==before;
       st.cursor=j.n;
-      if(!st.es||st.es.readyState===EventSource.CLOSED){
+      if(!st.es||st.es.readyState===EventSource.CLOSED
+         ||Date.now()-st.lastSse>3000){          // SSE silent >3s: poll owns updates
         if(!changed)addLog(j.lines);           // skip the batch that straddles
                                                // a run boundary (mixes old+new)
         onStats(j.stats);
