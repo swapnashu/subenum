@@ -89,6 +89,11 @@ change so a temp-dir loss doesn't take the suite with it.
 - An aiohttp `web.Response` payload is **single-use** — mock handlers must
   build a fresh `Response` per request, never reuse one shared instance
   (later requests silently 500 and baseline fetches come back empty).
+- Web-UI `$` is `document.getElementById` — never pass jQuery-style
+  `"#id"` selectors (`$("#x")` returns null → `.value` throws OUTSIDE the
+  start handler's try block → button silently dead, no red error).
+  jsdom harness: `Temp\opencode\jsdomtest\run.js` (clicks btnStart against
+  the live server; node fetch needs relative-URL resolution in beforeParse).
 
 ## Shell quirks (Windows cmd)
 - Multi-line `python -c` hangs → write a temp `.py` file and run it.

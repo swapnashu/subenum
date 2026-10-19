@@ -13877,9 +13877,9 @@ $("btnStart").onclick=async()=>{
   st.forcedLaunch=0;
   $("btnStart").disabled=true;
   const lines=id=>($(id).value||"").split(/[\r\n]+/).map(s=>s.trim()).filter(Boolean);
-  const creds=lines("#credPairs").map(s=>s.includes(":")?s:(":"+s));
-  const bruteU=lines("#bruteU");
-  const bruteP=lines("#bruteP");
+  const creds=lines("credPairs").map(s=>s.includes(":")?s:(":"+s));
+  const bruteU=lines("bruteU");
+  const bruteP=lines("bruteP");
   const num=id=>{const v=parseInt($(id).value,10);return Number.isFinite(v)?v:0;};
   try{
     const res=await fetch("/api/start",{method:"POST",
