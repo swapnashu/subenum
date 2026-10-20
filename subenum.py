@@ -3822,7 +3822,7 @@ async def check_port(host, port):
     async with PORT_SEM:
         try:
             reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port),
-                                                     timeout=2.5)
+                                                     timeout=1.8)
         except Exception:
             return None
         banner = b""
@@ -14810,38 +14810,38 @@ async def main():
         save_state(3)
     _mark("1-3")
 
-    # ---------------- phase 4 ----------------
-    if a.dns and start <= 5:
-        print(f"[4/19] dns + tls for {len(live)} hosts ...", flush=True)
-        cname, apex, chains, dangling = await dns_records(domains, live, findings)
-        if dangling:
-            print(f"      -> {len(dangling)} dangling CNAMEs", flush=True)
-        rec_hosts = record_subdomains(apex, domains)
+    # ---------------- phases 4 / 4b / 5 (parallel) ----------------
+    # dns+tls, reverse expansion and http probing all need only the post-3
+    # host set, so they run together.  names added by records/AXFR/TLS-SAN/
+    # reverse get a small delta probe pass, then wildcard filtering (which
+    # prunes live) runs on the settled live+probes - the same inputs the old
+    # serial order produced.
+    async def phase4_body():
+        cname_, apex_, chains_, dangling_ = await dns_records(domains, live, findings)
+        if dangling_:
+            print(f"      -> {len(dangling_)} dangling CNAMEs", flush=True)
+        rec_hosts = record_subdomains(apex_, domains)
         if rec_hosts:
             new_rec = rec_hosts - set(live)
             print(f"      record-derived names: {len(rec_hosts)}"
                   + (f" ({len(new_rec)} to verify)" if new_rec else ""), flush=True)
             if new_rec:
                 live.update(await resolve_all(new_rec, "records"))
-            evidence |= rec_hosts
-        axfr_hosts = await axfr_check(domains, apex, findings, a.axfr)
+            evidence.update(rec_hosts)
+        axfr_hosts = await axfr_check(domains, apex_, findings, a.axfr)
         if axfr_hosts:
             new_ax = axfr_hosts - set(live)
             if new_ax:
                 live.update(await resolve_all(new_ax, "axfr"))
-            evidence |= axfr_hosts
-        certs, newc = await tls_batch(sorted(live), findings, domains)
+            evidence.update(axfr_hosts)
+        certs_, newc = await tls_batch(sorted(live), findings, domains)
         if newc:
             print(f"      verifying {len(newc)} TLS-SAN names ...", flush=True)
             live.update(await resolve_all(newc, "san"))
-            evidence |= newc
-    elif start <= 5:
-        certs = {}          # start >= 6 keeps certs restored from the checkpoint
+            evidence.update(newc)
+        return certs_, cname_, apex_, chains_, dangling_
 
-    # ---------------- phase 4b: reverse + netblock ----------------
-    if a.reverse and start <= 5 and live:
-        print(f"[4b/19] reverse DNS + netblock expansion ({len(live)} hosts) ...",
-              flush=True)
+    async def phase4b_body():
         rev = await reverse_expand(live, domains, budget=a.ptr_budget,
                                    asn_expand=a.asn, netblocks=netblocks)
         if netblocks:
@@ -14853,12 +14853,44 @@ async def main():
                 print(f"      verifying {len(new_rev)} reverse-derived names ...",
                       flush=True)
                 live.update(await resolve_all(new_rev, "reverse"))
-            evidence |= rev
+            evidence.update(rev)
+        return rev
 
-    # ---------------- phase 5 ----------------
+    tasks45, keys45 = [], []
+    init45 = set(live)          # for the post-gather delta probe pass
+    if a.dns and start <= 5:
+        print(f"[4/19] dns + tls for {len(live)} hosts ...", flush=True)
+        tasks45.append(phase4_body())
+        keys45.append("dns-tls")
+    elif start <= 5:
+        certs = {}          # start >= 6 keeps certs restored from the checkpoint
+    if a.reverse and start <= 5 and live:
+        print(f"[4b/19] reverse DNS + netblock expansion ({len(live)} hosts) ...",
+              flush=True)
+        tasks45.append(phase4b_body())
+        keys45.append("reverse")
     if a.probe and start <= 5:
         print(f"[5/19] http probe on {len(live)} hosts ...", flush=True)
-        probes = await probe_all(sorted(live), findings)
+        tasks45.append(probe_all(sorted(live), findings))
+        keys45.append("probe")
+    p5_ok = True
+    if tasks45:
+        res45 = await asyncio.gather(*tasks45, return_exceptions=True)
+        for k45, r45 in zip(keys45, res45):
+            if isinstance(r45, BaseException):
+                if k45 == "probe":
+                    p5_ok = False
+                note_check_error(k45, f"failed: {r45}")
+            elif k45 == "dns-tls":
+                certs, cname, apex, chains, dangling = r45
+            elif k45 == "probe":
+                probes = r45
+    if a.probe and start <= 5 and p5_ok:
+        delta45 = [h for h in sorted(live) if h not in init45]
+        if delta45:
+            print(f"      probing {len(delta45)} expansion-derived hosts ...",
+                  flush=True)
+            probes.update(await probe_all(delta45, findings))
         miss = [h for h, i in probes.items() if not i.get("status")]
         if miss:
             print(f"      retry {len(miss)} unreachable hosts ...", flush=True)
