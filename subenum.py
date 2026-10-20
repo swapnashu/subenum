@@ -184,18 +184,23 @@ class _ProxySession(aiohttp.ClientSession):
         return await super()._request(method, url, **kwargs)
 
 
-def tsession(conn=None):
+def tsession(conn=None, own=None):
     """session for requests to the TARGET: carries auth headers when configured.
-    passive / DNS / third-party sessions keep using plain_session."""
+    passive / DNS / third-party sessions keep using plain_session.
+    A caller-provided connector is treated as SHARED (connector_owner=False):
+    ClientSession closes its connector on exit, and one check's exit would
+    otherwise kill the connector for every sibling sharing it."""
     return _ProxySession(connector=conn or aiohttp.TCPConnector(limit=0),
+                         connector_owner=(conn is None) if own is None else own,
                          headers=dict(AUTH_HEADERS) or None,
                          trace_configs=[_RATE_TRACE])
 
 
-def xsession(conn=None):
+def xsession(conn=None, own=None):
     """traced plain session for third-party sources (no target auth headers);
     429/503 backoff still applies so shared OSINT providers are not hammered."""
     return _ProxySession(connector=conn or aiohttp.TCPConnector(limit=0),
+                         connector_owner=(conn is None) if own is None else own,
                          trace_configs=[_RATE_TRACE])
 
 
@@ -738,6 +743,11 @@ websocket ws admin/login administrator/index.php admin.html dashboard.html
 login.html account/login console/login sso/login auth/login api/v1 api/v2 api/v3
 rest oauth sso saml ldap adfs id identity oidc cas forgot reset password reset-password
 billing invoice invoices orders order payments pay checkout subscription
+cpanel whm directadmin plesk cyberpanel hosting-panel control-panel
+cpanel-login cplogin panel-login server-panel
+backup.zip backup.tar database.zip dump.zip backup.sql.gz db.sql.gz
+dump.sql.gz config.bak settings.bak .bak index.php.bak wp-config.php.bak
+wp-config.php.old access.log error.log debug.log php_error.log
 """.split()))
 DIR_CRIT = {".git", ".git/config", ".git/HEAD", ".svn", ".svn/entries", ".env", ".env.local",
             ".env.staging", ".env.backup", ".aws", "server-info", "actuator/heapdump",
@@ -3209,7 +3219,8 @@ async def bucket_enum(domains, probes, findings, max_names=10, budget=70,
     seen_hit = set()          # one finding per (name, provider): the global
     sem = asyncio.Semaphore(20)   # and regional endpoints are the same bucket
     listing_rx = ("ListBucketResult", "<Blobs>", "EnumerationResults", "<Contents>")
-    async with xsession(aiohttp.TCPConnector(limit=0, ssl=False)) as s:
+    async with xsession(aiohttp.TCPConnector(limit=0, ssl=False),
+                        own=True) as s:
 
         async def try_write(url, n, kind):
             nonlocal writes
@@ -7437,7 +7448,8 @@ def dirlist_hit(body):
             or b"[to parent directory]" in b or b"directory listing for /" in b)
 
 
-async def content_discovery(probes, findings, dir_paths, cap_hosts=120):
+async def content_discovery(probes, findings, dir_paths, cap_hosts=120,
+                            conc=12):
     rows = []
     targets = [h for h in sorted(probes) if probes[h].get("status")][:cap_hosts]
     if not targets or not dir_paths:
@@ -7447,10 +7459,41 @@ async def content_discovery(probes, findings, dir_paths, cap_hosts=120):
     conn = aiohttp.TCPConnector(limit=0, ssl=False)
     async with tsession(conn) as s:
         bases = {}
+        dsem = asyncio.Semaphore(conc)   # per-origin pacing: an unbounded burst
+        attempts = 0                     # gets mass connection-dropped (LiteSpeed
+        hard = 0                         # /WAF kill ~300-way TLS fanout -> 0 hits)
+        skips = 0                        # exception-class failures
+        tbot = [90.0]                    # throttle-window skips (politeness)
+                                         # a 429/503 sets a _RATE backoff and _grab
+                                         # skips the host until it lapses - wait out
+                                         # SHORT windows (bounded), DEFER long ones
+
+        async def paced_grab(url, timeout=4, limit=12000):
+            nonlocal skips
+            for _ in range(3):
+                if fetch_throttled(url):
+                    stt = _RATE.get(_rate_key(url)) or {}
+                    wait = stt.get("until", 0.0) - time.time()
+                    if wait <= 0.02 or wait > 10.0 or tbot[0] <= 0:
+                        skips += 1       # long backoff / no budget: defer this
+                        return None, b"", {}, True
+                    wait = min(wait, tbot[0])
+                    tbot[0] -= wait
+                    await asyncio.sleep(wait + random.uniform(0.02, 0.25))
+                    continue             # concurrent successes re-extend windows:
+                                         # retry instead of burning the path as a fail
+                st, body, hd = await _grab(s, url, timeout=timeout,
+                                            limit=limit, check_throttle=False)
+                if st is not None:
+                    return st, body, hd, False
+                return None, b"", {}, False    # exception inside _grab: hard fail
+            return None, b"", {}, True
 
         async def get_base(h):
             base = _burl(probes, h)
-            bst, bbody, bhd = await _grab(s, f"{base}{bpath}", timeout=4)
+            async with dsem:
+                bst, bbody, bhd, _sk = await paced_grab(f"{base}{bpath}",
+                                                        timeout=4)
             if bst is None:
                 return
             bloc = _loc_path(bhd)
@@ -7463,71 +7506,79 @@ async def content_discovery(probes, findings, dir_paths, cap_hosts=120):
         byp_used = {}
 
         async def check(h, p):
+            nonlocal attempts, hard
             base, bst, blen, bpref, b_echo, bloc = bases[h]
             if probes[h].get("waf"):
                 await asyncio.sleep(0.12)      # WAF hosts: pace requests, avoid 429
             url = f"{base}/{p}"
-            st, body, hd = await _grab(s, url, timeout=4)
-            if st is None:
-                return
-            if st not in (200, 201, 301, 302, 303, 307, 308,
-                          401, 403, 405, 500, 503):
-                return
-            if st in REDIR:
-                loc = _loc_path(hd)
-                selfr = bool(loc) and loc.rstrip("/") == f"/{p}".rstrip("/")
-                if (selfr and b_echo) or (bloc and loc and loc == bloc):
-                    return                # generic/site-wide redirect, baseline too
-            elif st == bst and body[:200] == bpref:
-                return                    # soft-404 (prefix reliable; body len varies)
-            st2, body2, hd2 = await _grab(s, url, timeout=4)
-            if st2 != st:
-                return                    # flaky response, untrustworthy
-            if st in REDIR:
-                loc2 = _loc_path(hd2)
-                if (selfr and b_echo) or (bloc and loc2 and loc2 == bloc) \
-                        or loc2 != loc:
+            async with dsem:                   # hold the slot for the whole
+                attempts += 1                  # check: sequential grabs per path,
+                st, body, hd, skipped = await paced_grab(url, timeout=4)
+                if st is None:
+                    if not skipped:
+                        hard += 1
                     return
-                turl = urljoin(url, loc)
-                tst, tbody, _ = await _grab(s, turl, timeout=4)
-                if tst is None or tst not in (200, 201, 401, 403, 405, 500, 503):
-                    return                # dead/redirecting target: boring
-                if tst == bst and tbody[:200] == bpref:
-                    return                # target is the soft-404/catch-all page
-            else:
-                if st == bst and body2[:200] == bpref:
-                    return                # transient soft-404 variant
-                if body2[:200] != body[:200]:
-                    return                # unstable page, can't trust
-            ln = len(body)
-            tag = ("DIR-CRIT" if p in DIR_CRIT
-                   else "DIR-HOT" if DIR_HOT_RE.search(p) else "DIR")
-            if st == 403 and tag == "DIR-CRIT":
-                tag = "DIR-HOT"           # forbidden != confirmed leak
-            extra = f" -> {loc}" if st in REDIR and loc else ""
-            findings.append(f"[{tag}] {h}/{p} ({st}, {ln}B){extra}")
-            if st == 200 and dirlist_hit(body):
-                findings.append(f"[DIRLIST] {h}/{p} directory listing enabled ({ln}B)")
-            rows.append(f"{h}\t{st}\t{ln}\t/{p}")
-            # 403 on a juicy path: try known path-variant bypasses; only a
-            # stable 200 whose body differs from both the 403 page and the
-            # catch-all baseline counts as evidence
-            if st == 403 and tag in ("DIR-HOT", "DIR-CRIT") \
-                    and byp_used.get(h, 0) < 6:
-                byp_used[h] = byp_used.get(h, 0) + 1
-                for suf in ("/.", "%20", ";", "//", "%09", "/..;"):
-                    stv, bv, _ = await _grab(s, f"{base}/{p}{suf}", timeout=4)
-                    if stv != 200 or len(bv) < 80 or _body_similar(bv, body):
-                        continue
-                    if bv[:200] == bpref:
-                        continue            # catch-all/soft-404 page, not content
-                    stv2, bv2, _ = await _grab(s, f"{base}/{p}{suf}", timeout=4)
-                    if stv2 == 200 and bv2[:200] == bv[:200]:
-                        findings.append(
-                            f"[PATH-BYPASS] {h}/{p} 403 bypassed via {suf!r} "
-                            f"suffix (200, {len(bv)}B) - access control "
-                            f"enforced only at the edge")
-                        break
+                if st not in (200, 201, 301, 302, 303, 307, 308,
+                              401, 403, 405, 500, 503):
+                    return
+                if st in REDIR:
+                    loc = _loc_path(hd)
+                    selfr = bool(loc) and loc.rstrip("/") == f"/{p}".rstrip("/")
+                    if (selfr and b_echo) or (bloc and loc and loc == bloc):
+                        return            # generic/site-wide redirect, baseline too
+                elif st == bst and body[:200] == bpref:
+                    return                # soft-404 (prefix reliable; body len varies)
+                st2, body2, hd2, skipped2 = await paced_grab(url, timeout=4)
+                if st2 is None or st2 != st:
+                    if st2 is None and not skipped2:
+                        hard += 1
+                    return                # flaky response, untrustworthy
+                if st in REDIR:
+                    loc2 = _loc_path(hd2)
+                    if (selfr and b_echo) or (bloc and loc2 and loc2 == bloc) \
+                            or loc2 != loc:
+                        return
+                    turl = urljoin(url, loc)
+                    tst, tbody, _ = await _grab(s, turl, timeout=4)
+                    if tst is None or tst not in (200, 201, 401, 403, 405, 500, 503):
+                        return            # dead/redirecting target: boring
+                    if tst == bst and tbody[:200] == bpref:
+                        return            # target is the soft-404/catch-all page
+                else:
+                    if st == bst and body2[:200] == bpref:
+                        return            # transient soft-404 variant
+                    if body2[:200] != body[:200]:
+                        return            # unstable page, can't trust
+                ln = len(body)
+                tag = ("DIR-CRIT" if p in DIR_CRIT
+                       else "DIR-HOT" if DIR_HOT_RE.search(p) else "DIR")
+                if st == 403 and tag == "DIR-CRIT":
+                    tag = "DIR-HOT"       # forbidden != confirmed leak
+                extra = f" -> {loc}" if st in REDIR and loc else ""
+                findings.append(f"[{tag}] {h}/{p} ({st}, {ln}B){extra}")
+                if st == 200 and dirlist_hit(body):
+                    findings.append(
+                        f"[DIRLIST] {h}/{p} directory listing enabled ({ln}B)")
+                rows.append(f"{h}\t{st}\t{ln}\t/{p}")
+                # 403 on a juicy path: try known path-variant bypasses; only a
+                # stable 200 whose body differs from both the 403 page and the
+                # catch-all baseline counts as evidence
+                if st == 403 and tag in ("DIR-HOT", "DIR-CRIT") \
+                        and byp_used.get(h, 0) < 6:
+                    byp_used[h] = byp_used.get(h, 0) + 1
+                    for suf in ("/.", "%20", ";", "//", "%09", "/..;"):
+                        stv, bv, _ = await _grab(s, f"{base}/{p}{suf}", timeout=4)
+                        if stv != 200 or len(bv) < 80 or _body_similar(bv, body):
+                            continue
+                        if bv[:200] == bpref:
+                            continue        # catch-all/soft-404 page, not content
+                        stv2, bv2, _ = await _grab(s, f"{base}/{p}{suf}", timeout=4)
+                        if stv2 == 200 and bv2[:200] == bv[:200]:
+                            findings.append(
+                                f"[PATH-BYPASS] {h}/{p} 403 bypassed via {suf!r} "
+                                f"suffix (200, {len(bv)}B) - access control "
+                                f"enforced only at the edge")
+                            break
 
         jobs = [check(h, p) for h in bases for p in dir_paths]
         done = 0
@@ -7538,9 +7589,21 @@ async def content_discovery(probes, findings, dir_paths, cap_hosts=120):
                 note_check_error("dirs", f"failed: {e}")
             done += 1
             if done % 2000 == 0:
-                print(f"  [dirs] {done}/{len(jobs)} checks, {len(rows)} hits", flush=True)
+                print(f"  [dirs] {done}/{len(jobs)} checks, {len(rows)} hits",
+                      flush=True)
+        if attempts >= 20 and hard * 3 >= attempts:
+            note_check_error(
+                "dirs", f"{hard}/{attempts} requests failed (connection "
+                        f"errors) - dir coverage incomplete")
+        if skips >= 20 and skips * 3 >= attempts:
+            print(f"  [dirs] {skips}/{attempts} paths deferred during "
+                  f"rate-limit backoff (politeness) - coverage incomplete",
+                  flush=True)
+    waited = max(0.0, 90.0 - tbot[0])
     print(f"  [dirs] -> {len(rows)} interesting paths on {len(bases)} hosts "
-          f"({len(dir_paths)} paths)", flush=True)
+          f"({len(dir_paths)} paths"
+          + (f", {waited:.0f}s spent waiting out rate-limits" if waited > 1
+             else "") + ")", flush=True)
     return rows
 
 
@@ -7610,28 +7673,32 @@ async def vhost_brute(probes, live, domains, words, findings, cap_words=150):
             print("  [vhost] -> 0 vhost hits", flush=True)
             return rows
         total, done = len(checks) * len(cands), [0]
+        vsem = asyncio.Semaphore(20)   # per-origin pacing (same mass-reset
 
         async def one(ip, scheme, bstat, blen, bpref, cand):
-            a = await _grab(s, f"{scheme}://{ip}/", headers={"Host": cand}, timeout=5)
-            done[0] += 1
-            if done[0] % 1000 == 0:
-                print(f"  [vhost] {done[0]}/{total}", flush=True)
-            st, body = a[0], a[1]
-            if st is None or st not in (200, 201, 301, 302, 401, 403, 500):
-                return
-            if (st == bstat and abs(len(body) - blen) <= max(96, int(blen * 0.15))
-                    and body[:400] == bpref):
-                return                                        # same as default vhost
-            b = await _grab(s, f"{scheme}://{ip}/", headers={"Host": cand}, timeout=5)
-            if b[0] is None or not _same_resp(a, (b[0], b[1])):
-                return                                        # unstable -> dynamic backend
-            prev = body[:200].lower()
-            defaultish = any(x in prev for x in (b"default page", b"welcome to nginx",
-                                                  b"iis windows", b"apache2 ubuntu",
-                                                  b"it works!", b"coming soon"))
-            tag = "VHOST-DEFAULT" if defaultish else "VHOST"
-            findings.append(f"[{tag}] {scheme}://{ip}/ Host:{cand} ({st}, {len(body)}B)")
-            rows.append(f"{ip}\t{cand}\t{scheme}\t{st}\t{len(body)}")
+            async with vsem:           # failure mode as unbounded dir busting)
+                a = await _grab(s, f"{scheme}://{ip}/", headers={"Host": cand},
+                                timeout=5)
+                done[0] += 1
+                if done[0] % 1000 == 0:
+                    print(f"  [vhost] {done[0]}/{total}", flush=True)
+                st, body = a[0], a[1]
+                if st is None or st not in (200, 201, 301, 302, 401, 403, 500):
+                    return
+                if (st == bstat and abs(len(body) - blen) <= max(96, int(blen * 0.15))
+                        and body[:400] == bpref):
+                    return                                        # same as default vhost
+                b = await _grab(s, f"{scheme}://{ip}/", headers={"Host": cand},
+                                timeout=5)
+                if b[0] is None or not _same_resp(a, (b[0], b[1])):
+                    return                                        # unstable -> dynamic backend
+                prev = body[:200].lower()
+                defaultish = any(x in prev for x in (b"default page", b"welcome to nginx",
+                                                      b"iis windows", b"apache2 ubuntu",
+                                                      b"it works!", b"coming soon"))
+                tag = "VHOST-DEFAULT" if defaultish else "VHOST"
+                findings.append(f"[{tag}] {scheme}://{ip}/ Host:{cand} ({st}, {len(body)}B)")
+                rows.append(f"{ip}\t{cand}\t{scheme}\t{st}\t{len(body)}")
 
         await asyncio.gather(*[one(ip, scheme, bstat, blen, bpref, c)
                                 for ip, scheme, bstat, blen, bpref in checks
@@ -9762,11 +9829,11 @@ async def idor_matrix(probes, crawl_rows, findings, auth_b, cap_urls=60, per_hos
         return 0
     hit = 0
     conn = aiohttp.TCPConnector(limit=0, ssl=False)
-    async with tsession(conn) as s, \
+    async with tsession(conn, own=True) as s, \
             _ProxySession(connector=aiohttp.TCPConnector(limit=0, ssl=False),
                           headers=dict(hb),
                           trace_configs=[_RATE_TRACE]) as sB, \
-            xsession(aiohttp.TCPConnector(limit=0, ssl=False)) as sN:
+            xsession(aiohttp.TCPConnector(limit=0, ssl=False), own=True) as sN:
         # sB carries ONLY the account-B credential: if it were layered on
         # top of tsession's --cookie/--authorization, the server would
         # authenticate as A on both legs and every comparison would match
@@ -14844,7 +14911,9 @@ async def main():
         print(f"[9/19] {what} on {len(ok)} pages ...", flush=True)
         budget = [800]
         conn = aiohttp.TCPConnector(limit=0, ssl=False)
-        async with tsession(conn) as s, xsession(conn) as s2:
+        # s owns the shared connector: at exit s2 (non-owning) releases first,
+        # then s closes conn - one owner, no leak, no mid-use kill
+        async with tsession(conn, own=True) as s, xsession(conn) as s2:
             if a.secrets:
                 r9 = await asyncio.gather(
                     *[scan_host(s, h, probes[h], findings, budget,
@@ -14961,8 +15030,9 @@ async def main():
     # ---------------- waves 21/20/22: advanced + mass-assign + biz logic ----------------
     # previously three sequential asyncio.gather barriers (21 -> 20 -> 22);
     # merged into one gather so ~25 independent check families overlap.
-    # checks take their connector as an arg; they share only the append-only
-    # findings list, so a single shared connector is safe.
+    # checks take their connector as an arg and share it; xsession/tsession
+    # treat a passed-in connector as non-owning, so no check's exit can close
+    # it out from under the siblings (owner closes connw after the gather).
     if start <= 15 and live_http:
         connw = aiohttp.TCPConnector(limit=0, ssl=False)
         tasks21, tasks3, tasks22 = [], [], []
@@ -15025,6 +15095,9 @@ async def main():
             for (k, _t), r in zip(allwave, rw):
                 if isinstance(r, BaseException):
                     note_check_error(k, f"failed: {r}")
+        # every wave session is non-owning now (they share connw) - the
+        # caller created it, so the caller closes it
+        await connw.close()
         if a.portscan and port_results:
             up_hosts = sorted({h for h, p, _b in port_results if p in (5672, 6379, 11211)})
             up_hosts = up_hosts or sorted(live_http)
