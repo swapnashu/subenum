@@ -1727,6 +1727,7 @@ async def reverse_expand(live, domains, budget=4000, max_sweeps=40,
     """
     if not enabled or not live:
         return set()
+    t_r0 = time.time()
 
     def in_scope(name):
         name = str(name).rstrip(".").lower().strip()
@@ -1775,10 +1776,12 @@ async def reverse_expand(live, domains, budget=4000, max_sweeps=40,
                         found.add(g)
 
         # 2. PTR on every public live IP
+        t_r1 = time.time()
         await ptr_many(s, ips[:2500])
 
         # 3. /24 sweeps (densest = most live hosts first), budget-bounded;
         #    reserve ~1/3 (max 1200) for netblock sampling when ASN is on
+        t_r2 = time.time()
         reserve = min(1200, remaining // 3) if asn_expand else 0
         sweep_cap = remaining - reserve
         for b24, _cnt in blocks.most_common(max_sweeps):
@@ -1790,13 +1793,18 @@ async def reverse_expand(live, domains, budget=4000, max_sweeps=40,
             await ptr_many(s, todo)
 
         # 4. RIPEstat: covering prefixes + org-ASN announced prefixes
+        t_r3 = time.time()
         if asn_expand:
             rsem = asyncio.Semaphore(4)
             asns, cover = {}, {}          # cover: prefix -> owning ASNs
-            for ip in ips[:20]:
-                j = await _json_get(
-                    s, f"https://stat.ripe.net/data/network-info/data.json?resource={ip}",
-                    sem=rsem)
+            # ripe stages fetch concurrently (rsem keeps the same 4-wide cap
+            # as before - the loops were accidentally serial) then process
+            # sequentially, so cover/asns/netblocks see identical data order
+            js = await asyncio.gather(
+                *[_json_get(s, "https://stat.ripe.net/data/network-info/"
+                            f"data.json?resource={ip}", sem=rsem)
+                  for ip in ips[:20]])
+            for j in js:
                 data = (j or {}).get("data") or {}
                 pfx = str(data.get("prefix") or "")
                 try:
@@ -1810,10 +1818,12 @@ async def reverse_expand(live, domains, budget=4000, max_sweeps=40,
                     asns.setdefault(asn, None)
             # resolve holders first: cloud ASNs contribute no netblocks at all
             cloud = {}
-            for asn in list(asns)[:12]:
-                ov = await _json_get(
-                    s, f"https://stat.ripe.net/data/as-overview/data.json?resource=AS{asn}",
-                    sem=rsem)
+            _cand = list(asns)[:12]
+            ovs = await asyncio.gather(
+                *[_json_get(s, "https://stat.ripe.net/data/as-overview/"
+                            f"data.json?resource=AS{asn}", sem=rsem)
+                  for asn in _cand])
+            for asn, ov in zip(_cand, ovs):
                 holder = str((((ov or {}).get("data") or {}).get("holder")) or "").lower()
                 cloud[asn] = any(k in holder for k in CLOUD_HINTS)
             if netblocks is not None:
@@ -1826,14 +1836,14 @@ async def reverse_expand(live, domains, budget=4000, max_sweeps=40,
                 n = min(48, remaining)
                 remaining -= n
                 await ptr_many(s, _sample_addrs(cidr, n))
-            for asn in list(asns)[:8]:
+            _cand = [asn for asn in list(asns)[:8] if not cloud.get(asn, True)]
+            pjs = await asyncio.gather(
+                *[_json_get(s, "https://stat.ripe.net/data/announced-prefixes/"
+                            f"data.json?resource=AS{asn}", sem=rsem)
+                  for asn in _cand])
+            for asn, j in zip(_cand, pjs):
                 if remaining <= 32:
                     break
-                if cloud.get(asn, True):
-                    continue
-                j = await _json_get(
-                    s, f"https://stat.ripe.net/data/announced-prefixes/data.json?resource=AS{asn}",
-                    sem=rsem)
                 prefs = []
                 for p in (((j or {}).get("data") or {}).get("prefixes") or []):
                     cidr = str(p.get("prefix") or "")
@@ -1858,8 +1868,12 @@ async def reverse_expand(live, domains, budget=4000, max_sweeps=40,
                     remaining -= n
                     await ptr_many(s, _sample_addrs(cidr, n))
 
+    t_r4 = time.time()
     print(f"      reverse: {q[0]} PTR + {min(revip, len(blocks))} reverse-IP queries"
           f" -> {len(found)} in-scope names", flush=True)
+    print(f"      [timing] reverse-steps: revip={t_r1 - t_r0:.1f}s "
+          f"ptr={t_r2 - t_r1:.1f}s sweep={t_r3 - t_r2:.1f}s "
+          f"ripe={t_r4 - t_r3:.1f}s", flush=True)
     return found
 
 
@@ -14816,6 +14830,24 @@ async def main():
     # reverse get a small delta probe pass, then wildcard filtering (which
     # prunes live) runs on the settled live+probes - the same inputs the old
     # serial order produced.
+    def _timed(tasks, keys, td):
+        # wrap barrier coroutines so each prints its own wall time - the
+        # [timing] lines are how we decide the NEXT overlap, not guesswork
+        async def _w(coro, name):
+            t0 = time.time()
+            try:
+                return await coro
+            finally:
+                td[name] = round(time.time() - t0, 1)
+        return [_w(c, k) for c, k in zip(tasks, keys)]
+
+    def _tdump(tag, td):
+        if td:
+            print("      [timing] " + tag + ": "
+                  + " ".join(f"{k}={td[k]}s"
+                             for k in sorted(td, key=lambda x: td[x],
+                                             reverse=True)), flush=True)
+
     async def phase4_body():
         cname_, apex_, chains_, dangling_ = await dns_records(domains, live, findings)
         if dangling_:
@@ -14874,8 +14906,10 @@ async def main():
         tasks45.append(probe_all(sorted(live), findings))
         keys45.append("probe")
     p5_ok = True
+    t45 = {}
     if tasks45:
-        res45 = await asyncio.gather(*tasks45, return_exceptions=True)
+        res45 = await asyncio.gather(*_timed(tasks45, keys45, t45),
+                                     return_exceptions=True)
         for k45, r45 in zip(keys45, res45):
             if isinstance(r45, BaseException):
                 if k45 == "probe":
@@ -14885,6 +14919,7 @@ async def main():
                 certs, cname, apex, chains, dangling = r45
             elif k45 == "probe":
                 probes = r45
+        _tdump("4-5", t45)
     if a.probe and start <= 5 and p5_ok:
         delta45 = [h for h in sorted(live) if h not in init45]
         if delta45:
@@ -14949,8 +14984,10 @@ async def main():
             tasks.append(wb_task)
             keys.append("wayback")
         port_results, wb_paths, wb_attr = [], [], {}
+        t68 = {}
         if tasks:
-            res = await asyncio.gather(*tasks, return_exceptions=True)
+            res = await asyncio.gather(*_timed(tasks, keys, t68),
+                                       return_exceptions=True)
             for k, r in zip(keys, res):
                 if isinstance(r, BaseException):
                     note_check_error(k, f"failed: {r}")
@@ -14959,6 +14996,7 @@ async def main():
                     port_results = r
                 elif k == "wayback":
                     wb_paths, wb_attr = r
+            _tdump("6-8", t68)
     _mark("6-8")
 
     # ---------------- barrier A: secrets | takeover | content discovery ----
@@ -14967,9 +15005,9 @@ async def main():
     # assembly stays after it: phase 9's wayback-JS mining feeds all_paths/
     # attrib for the waves + active checks in barrier B.
     async def waves_body():
-        # waves 21/20/22 + udp as a single barrier-B task: previously three
-        # sequential gather barriers (21 -> 20 -> 22) plus a post-gather udp
-        # pass, each waiting behind the previous phase. checks share connw;
+        # waves 21/20/22 as a single barrier-B task: previously three
+        # sequential gather barriers (21 -> 20 -> 22), each waiting behind
+        # the previous phase. checks share connw;
         # xsession/tsession treat a passed-in connector as non-owning, so no
         # check's exit can close it out from under the siblings (this owner
         # closes connw after the inner gather).
@@ -15029,35 +15067,48 @@ async def main():
                   f"({len(live_http)} hosts) ...", flush=True)
         allwave = tasks21 + tasks3 + tasks22
         if allwave:
-            rw = await asyncio.gather(*[t for _k, t in allwave],
-                                      return_exceptions=True)
+            tW = {}
+            rw = await asyncio.gather(
+                *_timed([t for _k, t in allwave],
+                        [k for k, _t in allwave], tW),
+                return_exceptions=True)
             for (k, _t), r in zip(allwave, rw):
                 if isinstance(r, BaseException):
                     note_check_error(k, f"failed: {r}")
+            _tdump("waves", tW)
         # every wave session is non-owning now (they share connw) - the
         # caller created it, so the caller closes it
         await connw.close()
-        if a.portscan and port_results:
-            up_hosts = sorted({h for h, p, _b in port_results if p in (5672, 6379, 11211)})
-            up_hosts = up_hosts or sorted(live_http)
-            try:
-                await udp_service_checks(up_hosts, findings)
-            except Exception as ue:
-                note_check_error("udp", f"failed: {ue}")
 
     tasks2, keys2 = [], []          # barrier B: waves | surface | phases 16-18
     sweep_new = set()               # sweep hosts found after the nuclei spawn
     if start <= 15:
         live_http = [h for h in sorted(probes) if probes[h].get("status")]
         sm = {}
+        # udp probes need only 6-8's port_results + live_http: spawn them here
+        # so they overlap barrier A (waves used to serialize them behind every
+        # inner wave check). the task joins tasks2 below, so B still awaits it
+        # before save_state(15) and a failure still notes tag "udp".
+        udp_task = None
+        if live_http and a.portscan and port_results:
+            _up = sorted({h for h, p, _b in port_results if p in (5672, 6379, 11211)})
+            udp_task = asyncio.create_task(
+                udp_service_checks(_up or sorted(live_http), findings))
 
-        async def phase9_body(ok):
+        async def phase9_core(ok):
+            # secrets-side phase 9: scan_host + wayback-JS mining + firebase +
+            # wp versions.  both mining paths (scan_host blobs, wayback JS)
+            # feed assembly's all_paths/attrib, so barrier A waits for THIS.
+            # file_leaks mines/harvests nothing -> it runs as its own task and
+            # joins barrier B (overlapping this whole assembly window).
+            if not a.secrets:
+                return
             budget = [800]
             conn = aiohttp.TCPConnector(limit=0, ssl=False)
             # s owns the shared connector: at exit s2 (non-owning) releases
             # first, then s closes conn - one owner, no leak, no mid-use kill
             async with tsession(conn, own=True) as s, xsession(conn) as s2:
-                if a.secrets:
+                async def _scan():
                     r9 = await asyncio.gather(
                         *[scan_host(s, h, probes[h], findings, budget,
                                     mined if a.mine else None,
@@ -15068,25 +15119,33 @@ async def main():
                     if nf:
                         print(f"  [secrets] {nf} host scan(s) raised and were skipped",
                               flush=True)
-                    if a.wayback:
-                        wjs = await wayback_js(domains)
-                        sem = asyncio.Semaphore(8)
-                        blobs = await asyncio.gather(
-                            *[fetch_blob(s2, "https://web.archive.org/web/0id_/" + u, 25, sem)
-                              for u in wjs],
-                            return_exceptions=True)
-                        got = 0
-                        for u, data in zip(wjs, blobs):
-                            if not data or isinstance(data, BaseException):
-                                continue
-                            wh = urlsplit(u).netloc.lower().split(":")[0] or "wayback"
-                            scan_blob(wh, u, data, findings, surf)
-                            if a.mine:
-                                mine(wh, data, mined)
-                            got += 1
-                        print(f"      + {got}/{len(wjs)} archived JS snapshots scanned", flush=True)
+
+                async def _wayback():
+                    if not a.wayback:
+                        return
+                    wjs = await wayback_js(domains)
+                    sem = asyncio.Semaphore(8)
+                    blobs = await asyncio.gather(
+                        *[fetch_blob(s2, "https://web.archive.org/web/0id_/" + u, 25, sem)
+                          for u in wjs],
+                        return_exceptions=True)
+                    got = 0
+                    for u, data in zip(wjs, blobs):
+                        if not data or isinstance(data, BaseException):
+                            continue
+                        wh = urlsplit(u).netloc.lower().split(":")[0] or "wayback"
+                        scan_blob(wh, u, data, findings, surf)
+                        if a.mine:
+                            mine(wh, data, mined)
+                        got += 1
+                    print(f"      + {got}/{len(wjs)} archived JS snapshots scanned",
+                          flush=True)
+
+                async def _firebase():
                     if FIREBASE_DBS or FIREBASE_BUCKETS:
                         await firebase_scan(s, findings)
+
+                async def _wpver():
                     r9p = await asyncio.gather(
                         *[wp_plugin_ver(s, h, findings) for h in ok],
                         return_exceptions=True)
@@ -15094,16 +15153,33 @@ async def main():
                     if npv:
                         print(f"  [wpver] {npv} host(s) raised and were skipped",
                               flush=True)
-                if a.files:
-                    r9f = await asyncio.gather(
-                        *[file_leaks(s, h, findings) for h in ok],
-                        return_exceptions=True)
-                    nff = sum(1 for x in r9f if isinstance(x, BaseException))
-                    if nff:
-                        print(f"  [files] {nff} host leak scan(s) raised and were skipped",
-                              flush=True)
+
+                td9 = {}
+                rs = await asyncio.gather(
+                    *_timed([_scan(), _wayback(), _firebase(), _wpver()],
+                            ["scan", "wayback", "firebase", "wpver"], td9),
+                    return_exceptions=True)
+                for _e in [x for x in rs if isinstance(x, BaseException)]:
+                    note_check_error("secrets", f"failed: {_e}")
+                _tdump("phase9-core", td9)
+
+        async def phase9_files(ok):
+            # findings-only phase 9: writes neither mined nor surf, so it is
+            # safe beside barrier A (assembly) and barrier B (surface/enum)
+            if not a.files:
+                return
+            conn = aiohttp.TCPConnector(limit=0, ssl=False)
+            async with tsession(conn, own=True) as s:
+                r9f = await asyncio.gather(
+                    *[file_leaks(s, h, findings) for h in ok],
+                    return_exceptions=True)
+                nff = sum(1 for x in r9f if isinstance(x, BaseException))
+                if nff:
+                    print(f"  [files] {nff} host leak scan(s) raised and were skipped",
+                          flush=True)
 
         tasksA, keysA = [], []
+        p9f_task = None
         if probes and (a.secrets or a.files):
             # any answered page (401/403/301/500 too) can leak secrets and holds
             # files to probe - only an unanswered (None/0) probe is skipped
@@ -15111,8 +15187,13 @@ async def main():
             what = ("secret scan + file leaks" if a.secrets and a.files
                     else "secret scan" if a.secrets else "file leak check")
             print(f"[9/19] {what} on {len(ok)} pages ...", flush=True)
-            tasksA.append(phase9_body(ok))
-            keysA.append("secrets")
+            if a.secrets:
+                tasksA.append(phase9_core(ok))
+                keysA.append("secrets")
+            if a.files:
+                # scheduled NOW: file_leaks overlaps barrier A's other tasks
+                # AND barrier B (its results join the barrier-B gather)
+                p9f_task = asyncio.create_task(phase9_files(ok))
         else:
             print("[9/19] secret/file scan skipped (flags off or no pages)",
                   flush=True)
@@ -15149,8 +15230,10 @@ async def main():
         if a.mine and probes:
             tasksA.append(sitemap_paths(probes))
             keysA.append("sitemap")
+        tA = {}
         if tasksA:
-            resA = await asyncio.gather(*tasksA, return_exceptions=True)
+            resA = await asyncio.gather(*_timed(tasksA, keysA, tA),
+                                        return_exceptions=True)
             for k, r in zip(keysA, resA):
                 if isinstance(r, BaseException):
                     note_check_error(k, f"failed: {r}")
@@ -15167,6 +15250,7 @@ async def main():
                     method_rows = r
                 elif k == "sitemap":
                     sm = r
+            _tdump("A", tA)
 
         # assembly: phase 9's wayback-JS mining lands in mined before this
         # snapshot (the same data the old sequential order produced)
@@ -15206,6 +15290,12 @@ async def main():
         tasks2.append(surface_cve(probes, surf, all_paths, port_results,
                                   scripts_by_host, findings, do_cve=a.cve))
         keys2.append("surface")
+        if p9f_task is not None:
+            tasks2.append(p9f_task)
+            keys2.append("files")
+        if udp_task is not None:
+            tasks2.append(udp_task)
+            keys2.append("udp")
 
     _n16 = len(tasks2)              # index where phases 16-18 tasks start
     mined_n = sum(len(ps) for ps in mined.values())
@@ -15287,7 +15377,9 @@ async def main():
     else:
         print("[16-18/19] skipped: no active checks enabled", flush=True)
     if tasks2:
-        res2 = await asyncio.gather(*tasks2, return_exceptions=True)
+        tB = {}
+        res2 = await asyncio.gather(*_timed(tasks2, keys2, tB),
+                                    return_exceptions=True)
         for k, r in zip(keys2, res2):
             if isinstance(r, BaseException):
                 if k == "surface":
@@ -15306,6 +15398,7 @@ async def main():
                               flush=True)
                         live.update(await resolve_all(new_sw, "sweep"))
                         sweep_new |= new_sw
+        _tdump("B", tB)
     if start <= 15:
         save_state(15, with_probes=True)
     cdn = surfinfo.get("cdn", {})
