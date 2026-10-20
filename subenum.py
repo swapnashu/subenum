@@ -7449,7 +7449,7 @@ def dirlist_hit(body):
 
 
 async def content_discovery(probes, findings, dir_paths, cap_hosts=120,
-                            conc=12):
+                            conc=24):
     rows = []
     targets = [h for h in sorted(probes) if probes[h].get("status")][:cap_hosts]
     if not targets or not dir_paths:
@@ -14736,6 +14736,19 @@ async def main():
         except Exception as e:
             note_check_error("state", f"save failed: {e}")
 
+    # ---------------- timing + background helpers ----------------
+    _tmarks, _tlast = [], [time.time()]
+
+    def _mark(label):
+        now = time.time()
+        _tmarks.append(f"{label}={now - _tlast[0]:.0f}s")
+        _tlast[0] = now
+
+    # phase 8 (wayback CDX) needs only the target list: start it at t=0 so
+    # it overlaps passive OSINT + DNS brute + probe instead of waiting
+    wb_task = (asyncio.create_task(wayback_paths(domains))
+               if (a.wayback and start <= 15 and domains) else None)
+
     # ---------------- phases 1-3 ----------------
     if start <= 3:
         print("[1/19] passive OSINT ...", flush=True)
@@ -14795,6 +14808,7 @@ async def main():
             if n:
                 print(f"      -> {n} wildcard fillers removed (IP match)", flush=True)
         save_state(3)
+    _mark("1-3")
 
     # ---------------- phase 4 ----------------
     if a.dns and start <= 5:
@@ -14863,6 +14877,22 @@ async def main():
             wp_enum(probes, findings),
             return_exceptions=True)
         save_state(5, with_probes=True)
+    _mark("4-5")
+
+    # ---------------- phase 19: nuclei (background from here) ---------------
+    # nuclei only needs live+probes, both ready after phase 5. running it
+    # dead-last made it the tail of every scan; it now overlaps phases 6-18.
+    # the host set is snapshotted: phase-16 sweep additions get a small
+    # second pass after the main await.
+    nuc_task = None
+    if a.nuclei and live:
+        print(f"[19/19] nuclei engine ({len(live)} hosts, "
+              f"sev={a.nuclei_sev}) ... (running in background)", flush=True)
+        nuc_task = asyncio.create_task(
+            nuclei_phase(dict(live), probes, findings, a.nuclei_sev,
+                         a.nuclei_rate, a.nuclei_timeout))
+    else:
+        print("[19/19] nuclei skipped (--no-nuclei or no live hosts)", flush=True)
 
     # ---------------- phases 6/7/8 parallel ----------------
     if start <= 15:
@@ -14883,8 +14913,8 @@ async def main():
         if a.portscan and live:
             tasks.append(port_scan(sorted(live), plist, findings))
             keys.append("ports")
-        if a.wayback:
-            tasks.append(wayback_paths(domains))
+        if a.wayback and wb_task is not None:
+            tasks.append(wb_task)
             keys.append("wayback")
         port_results, wb_paths, wb_attr = [], [], {}
         if tasks:
@@ -14897,143 +14927,20 @@ async def main():
                     port_results = r
                 elif k == "wayback":
                     wb_paths, wb_attr = r
+    _mark("6-8")
 
-    # ---------------- phase 9 ----------------
-    # a.files (file leaks) is NOT a secret scan: it must run even with
-    # --no-secrets (it used to be nested under the a.secrets gate, so
-    # `--files --no-secrets` silently scanned nothing)
-    if start <= 15 and probes and (a.secrets or a.files):
-        # any answered page (401/403/301/500 too) can leak secrets and holds
-        # files to probe - only an unanswered (None/0) probe is skipped
-        ok = [h for h, i in probes.items() if i.get("status")][:a.max_scan]
-        what = ("secret scan + file leaks" if a.secrets and a.files
-                else "secret scan" if a.secrets else "file leak check")
-        print(f"[9/19] {what} on {len(ok)} pages ...", flush=True)
-        budget = [800]
-        conn = aiohttp.TCPConnector(limit=0, ssl=False)
-        # s owns the shared connector: at exit s2 (non-owning) releases first,
-        # then s closes conn - one owner, no leak, no mid-use kill
-        async with tsession(conn, own=True) as s, xsession(conn) as s2:
-            if a.secrets:
-                r9 = await asyncio.gather(
-                    *[scan_host(s, h, probes[h], findings, budget,
-                                mined if a.mine else None,
-                                scripts_by_host.get(h, ()), surf)
-                      for h in ok],
-                    return_exceptions=True)
-                nf = sum(1 for x in r9 if isinstance(x, BaseException))
-                if nf:
-                    print(f"  [secrets] {nf} host scan(s) raised and were skipped",
-                          flush=True)
-                if a.wayback:
-                    wjs = await wayback_js(domains)
-                    sem = asyncio.Semaphore(8)
-                    blobs = await asyncio.gather(
-                        *[fetch_blob(s2, "https://web.archive.org/web/0id_/" + u, 25, sem)
-                          for u in wjs],
-                        return_exceptions=True)
-                    got = 0
-                    for u, data in zip(wjs, blobs):
-                        if not data or isinstance(data, BaseException):
-                            continue
-                        wh = urlsplit(u).netloc.lower().split(":")[0] or "wayback"
-                        scan_blob(wh, u, data, findings, surf)
-                        if a.mine:
-                            mine(wh, data, mined)
-                        got += 1
-                    print(f"      + {got}/{len(wjs)} archived JS snapshots scanned", flush=True)
-                if FIREBASE_DBS or FIREBASE_BUCKETS:
-                    await firebase_scan(s, findings)
-                r9p = await asyncio.gather(
-                    *[wp_plugin_ver(s, h, findings) for h in ok],
-                    return_exceptions=True)
-                npv = sum(1 for x in r9p if isinstance(x, BaseException))
-                if npv:
-                    print(f"  [wpver] {npv} host(s) raised and were skipped",
-                          flush=True)
-            if a.files:
-                r9f = await asyncio.gather(
-                    *[file_leaks(s, h, findings) for h in ok],
-                    return_exceptions=True)
-                nff = sum(1 for x in r9f if isinstance(x, BaseException))
-                if nff:
-                    print(f"  [files] {nff} host leak scan(s) raised and were skipped",
-                          flush=True)
-    elif start <= 15:
-        print("[9/19] secret/file scan skipped (flags off or no pages)", flush=True)
-
-    # ---------------- phase 10 ----------------
-    if start <= 15 and a.takeover:
-        print(f"[10/19] takeover check: {len(dangling)} dangling CNAMEs ...", flush=True)
-        if dangling:
-            await takeover_confirm(dangling, probes, findings)
-    elif start <= 15:
-        print("[10/19] takeover check skipped (--no-takeover)", flush=True)
-
-    # ---------------- phases 11/12/13/14 parallel ----------------
-    if start <= 15:
-        live_http = [h for h in sorted(probes) if probes[h].get("status")]
-        dir_rows, vhost_rows, api_rows, method_rows = [], [], [], []
-        # waves 21/20/22 read attrib/crawl_rows - assemble them here (after
-        # phase 11-14 mining, before the waves) so a fresh run never reads
-        # an unbound cell (was a latent UnboundLocalError crash).
-        all_paths = set(wb_paths)
-        attrib = {p: set(hs) for p, hs in wb_attr.items()}
-        if a.mine:
-            for h, ps in mined.items():
-                all_paths |= ps
-                for p in ps:
-                    attrib.setdefault(p, set()).add(h)
-            if probes:
-                sm = await sitemap_paths(probes)
-                for p, hs in sm.items():
-                    all_paths.add(p)
-                    attrib.setdefault(p, set()).update(hs)
-        crawl_rows = sorted(f"{h}\t{p}" for p, hs in attrib.items() for h in hs)
-        tasks2, keys2 = [], []
-        if a.dirs and live_http:
-            tasks2.append(content_discovery(probes, findings, dir_paths))
-            keys2.append("dirs")
-        if a.vhost and live:
-            tasks2.append(vhost_brute(probes, live, domains, vw, findings))
-            keys2.append("vhost")
-        if a.api and live_http:
-            tasks2.append(api_spec(probes, findings, schema_out=base + "_graphql.txt"))
-            keys2.append("api")
-            tasks2.append(llm_surface_checks(probes, findings))
-            keys2.append("llm")
-        if a.methods and live_http:
-            tasks2.append(method_matrix(probes, findings))
-            keys2.append("methods")
-        if tasks2:
-            print(f"[11-14/19] dirs | vhost | api-spec | llm | methods "
-                  f"({len(live_http)} hosts) ...", flush=True)
-            res = await asyncio.gather(*tasks2, return_exceptions=True)
-            for k, r in zip(keys2, res):
-                if isinstance(r, BaseException):
-                    note_check_error(k, f"failed: {r}")
-                    continue
-                if k == "dirs":
-                    dir_rows = r
-                elif k == "vhost":
-                    vhost_rows = r
-                elif k == "api":
-                    api_rows = r
-                elif k == "llm":
-                    llm_rows = r
-                else:
-                    method_rows = r
-        else:
-            print("[11-14/19] skipped: dirs/vhost/api-spec/methods all off",
-                  flush=True)
-
-    # ---------------- waves 21/20/22: advanced + mass-assign + biz logic ----------------
-    # previously three sequential asyncio.gather barriers (21 -> 20 -> 22);
-    # merged into one gather so ~25 independent check families overlap.
-    # checks take their connector as an arg and share it; xsession/tsession
-    # treat a passed-in connector as non-owning, so no check's exit can close
-    # it out from under the siblings (owner closes connw after the gather).
-    if start <= 15 and live_http:
+    # ---------------- barrier A: secrets | takeover | content discovery ----
+    # phases 9/10/11-14 + sitemap all need only post-phase-6/8 state, so they
+    # run as ONE gather (wall = max instead of the sum of four barriers).
+    # assembly stays after it: phase 9's wayback-JS mining feeds all_paths/
+    # attrib for the waves + active checks in barrier B.
+    async def waves_body():
+        # waves 21/20/22 + udp as a single barrier-B task: previously three
+        # sequential gather barriers (21 -> 20 -> 22) plus a post-gather udp
+        # pass, each waiting behind the previous phase. checks share connw;
+        # xsession/tsession treat a passed-in connector as non-owning, so no
+        # check's exit can close it out from under the siblings (this owner
+        # closes connw after the inner gather).
         connw = aiohttp.TCPConnector(limit=0, ssl=False)
         tasks21, tasks3, tasks22 = [], [], []
         if a.params or a.methods:
@@ -15106,24 +15013,175 @@ async def main():
             except Exception as ue:
                 note_check_error("udp", f"failed: {ue}")
 
-    # endpoints (all_paths/attrib/crawl_rows) are assembled in the phase
-    # 11-14 block above so waves 20-22 can consume them.
-    mined_n = sum(len(ps) for ps in mined.values())
-
-    # ---------------- phase 15 ----------------
+    tasks2, keys2 = [], []          # barrier B: waves | surface | phases 16-18
+    sweep_new = set()               # sweep hosts found after the nuclei spawn
     if start <= 15:
+        live_http = [h for h in sorted(probes) if probes[h].get("status")]
+        sm = {}
+
+        async def phase9_body(ok):
+            budget = [800]
+            conn = aiohttp.TCPConnector(limit=0, ssl=False)
+            # s owns the shared connector: at exit s2 (non-owning) releases
+            # first, then s closes conn - one owner, no leak, no mid-use kill
+            async with tsession(conn, own=True) as s, xsession(conn) as s2:
+                if a.secrets:
+                    r9 = await asyncio.gather(
+                        *[scan_host(s, h, probes[h], findings, budget,
+                                    mined if a.mine else None,
+                                    scripts_by_host.get(h, ()), surf)
+                          for h in ok],
+                        return_exceptions=True)
+                    nf = sum(1 for x in r9 if isinstance(x, BaseException))
+                    if nf:
+                        print(f"  [secrets] {nf} host scan(s) raised and were skipped",
+                              flush=True)
+                    if a.wayback:
+                        wjs = await wayback_js(domains)
+                        sem = asyncio.Semaphore(8)
+                        blobs = await asyncio.gather(
+                            *[fetch_blob(s2, "https://web.archive.org/web/0id_/" + u, 25, sem)
+                              for u in wjs],
+                            return_exceptions=True)
+                        got = 0
+                        for u, data in zip(wjs, blobs):
+                            if not data or isinstance(data, BaseException):
+                                continue
+                            wh = urlsplit(u).netloc.lower().split(":")[0] or "wayback"
+                            scan_blob(wh, u, data, findings, surf)
+                            if a.mine:
+                                mine(wh, data, mined)
+                            got += 1
+                        print(f"      + {got}/{len(wjs)} archived JS snapshots scanned", flush=True)
+                    if FIREBASE_DBS or FIREBASE_BUCKETS:
+                        await firebase_scan(s, findings)
+                    r9p = await asyncio.gather(
+                        *[wp_plugin_ver(s, h, findings) for h in ok],
+                        return_exceptions=True)
+                    npv = sum(1 for x in r9p if isinstance(x, BaseException))
+                    if npv:
+                        print(f"  [wpver] {npv} host(s) raised and were skipped",
+                              flush=True)
+                if a.files:
+                    r9f = await asyncio.gather(
+                        *[file_leaks(s, h, findings) for h in ok],
+                        return_exceptions=True)
+                    nff = sum(1 for x in r9f if isinstance(x, BaseException))
+                    if nff:
+                        print(f"  [files] {nff} host leak scan(s) raised and were skipped",
+                              flush=True)
+
+        tasksA, keysA = [], []
+        if probes and (a.secrets or a.files):
+            # any answered page (401/403/301/500 too) can leak secrets and holds
+            # files to probe - only an unanswered (None/0) probe is skipped
+            ok = [h for h, i in probes.items() if i.get("status")][:a.max_scan]
+            what = ("secret scan + file leaks" if a.secrets and a.files
+                    else "secret scan" if a.secrets else "file leak check")
+            print(f"[9/19] {what} on {len(ok)} pages ...", flush=True)
+            tasksA.append(phase9_body(ok))
+            keysA.append("secrets")
+        else:
+            print("[9/19] secret/file scan skipped (flags off or no pages)",
+                  flush=True)
+
+        if a.takeover:
+            print(f"[10/19] takeover check: {len(dangling)} dangling CNAMEs ...",
+                  flush=True)
+            if dangling:
+                tasksA.append(takeover_confirm(dangling, probes, findings))
+                keysA.append("takeover")
+        else:
+            print("[10/19] takeover check skipped (--no-takeover)", flush=True)
+
+        disc = []
+        if a.dirs and live_http:
+            disc.append((content_discovery(probes, findings, dir_paths), "dirs"))
+        if a.vhost and live:
+            disc.append((vhost_brute(probes, live, domains, vw, findings), "vhost"))
+        if a.api and live_http:
+            disc.append((api_spec(probes, findings,
+                                  schema_out=base + "_graphql.txt"), "api"))
+            disc.append((llm_surface_checks(probes, findings), "llm"))
+        if a.methods and live_http:
+            disc.append((method_matrix(probes, findings), "methods"))
+        if disc:
+            print(f"[11-14/19] dirs | vhost | api-spec | llm | methods "
+                  f"({len(live_http)} hosts) ...", flush=True)
+            for _c, _k in disc:
+                tasksA.append(_c)
+                keysA.append(_k)
+        else:
+            print("[11-14/19] skipped: dirs/vhost/api-spec/methods all off",
+                  flush=True)
+        if a.mine and probes:
+            tasksA.append(sitemap_paths(probes))
+            keysA.append("sitemap")
+        if tasksA:
+            resA = await asyncio.gather(*tasksA, return_exceptions=True)
+            for k, r in zip(keysA, resA):
+                if isinstance(r, BaseException):
+                    note_check_error(k, f"failed: {r}")
+                    continue
+                if k == "dirs":
+                    dir_rows = r
+                elif k == "vhost":
+                    vhost_rows = r
+                elif k == "api":
+                    api_rows = r
+                elif k == "llm":
+                    llm_rows = r
+                elif k == "methods":
+                    method_rows = r
+                elif k == "sitemap":
+                    sm = r
+
+        # assembly: phase 9's wayback-JS mining lands in mined before this
+        # snapshot (the same data the old sequential order produced)
+        all_paths = set(wb_paths)
+        attrib = {p: set(hs) for p, hs in wb_attr.items()}
+        if a.mine:
+            for h, ps in mined.items():
+                all_paths |= ps
+                for p in ps:
+                    attrib.setdefault(p, set()).add(h)
+            for p, hs in sm.items():
+                all_paths.add(p)
+                attrib.setdefault(p, set()).update(hs)
+        crawl_rows = sorted(f"{h}\t{p}" for p, hs in attrib.items() for h in hs)
+        # probe-body harvest: surface_cve (phase 15) now runs inside the same
+        # gather as user_enum, but user_enum's gate/seeding reads surf at
+        # gather-build time - harvest here so the data is identical to the old
+        # run-at-phase-15-first order (harvest is idempotent)
+        for h, i in probes.items():
+            _hb = i.get("body") or b""
+            if _hb:
+                harvest(h, i.get("final_url") or f"{_burl(probes, h)}/",
+                        _hb, surf)
+        _mark("A")
+
+        if live_http:
+            tasks2.append(waves_body())
+            keys2.append("waves")
+
         print("[15/19] surface harvest + CVE/EOL/CDN analysis ...", flush=True)
         if a.mailsec and domains:
-            await dns_hardening_checks(domains, findings)
+            tasks2.append(dns_hardening_checks(domains, findings))
+            keys2.append("mailsec")
         if a.nsecwalk and domains:
-            await nsec_zone_walk(domains, findings)
-        surfinfo = await surface_cve(probes, surf, all_paths, port_results,
-                                     scripts_by_host, findings, do_cve=a.cve)
-        save_state(15, with_probes=True)
-    cdn = surfinfo["cdn"]
+            tasks2.append(nsec_zone_walk(domains, findings))
+            keys2.append("nsecwalk")
+        tasks2.append(surface_cve(probes, surf, all_paths, port_results,
+                                  scripts_by_host, findings, do_cve=a.cve))
+        keys2.append("surface")
+
+    _n16 = len(tasks2)              # index where phases 16-18 tasks start
+    mined_n = sum(len(ps) for ps in mined.values())
 
     # ---------------- active scanning: phases 16-18 (parallel) ----------------
-    tasks2, keys2 = [], []
+    # tasks2/keys2 already hold barrier-B waves/surface tasks; the checks
+    # below join the SAME gather (all of them only need pre-discovery state;
+    # basic-auth/backup read dir_rows, which barrier A has already produced)
     if a.params and probes:
         tasks2.append(param_attacks(probes, attrib, findings, a.attack_budget,
                                     sqli=a.sqli, cmdi=a.cmdi,
@@ -15192,12 +15250,19 @@ async def main():
     if a.smtp and domains:
         tasks2.append(smtp_checks(domains, findings))
         keys2.append("smtpchecks")
+    if len(tasks2) > _n16:
+        print(f"[16-18/19] {' | '.join(keys2[_n16:])} (parallel) ...", flush=True)
+    else:
+        print("[16-18/19] skipped: no active checks enabled", flush=True)
     if tasks2:
-        print(f"[16-18/19] {' | '.join(keys2)} (parallel) ...", flush=True)
         res2 = await asyncio.gather(*tasks2, return_exceptions=True)
         for k, r in zip(keys2, res2):
             if isinstance(r, BaseException):
+                if k == "surface":
+                    surfinfo = {"cdn": {}, "params": 0, "cves": [], "js": 0}
                 note_check_error(k, f"failed: {r}")
+            elif k == "surface":
+                surfinfo = r
             elif k == "sweep" and r:
                 rows2, sw_names = r
                 port_results = sorted(set(port_results) | set(rows2))
@@ -15208,17 +15273,27 @@ async def main():
                         print(f"      verifying {len(new_sw)} sweep PTR names ...",
                               flush=True)
                         live.update(await resolve_all(new_sw, "sweep"))
-    else:
-        print("[16-18/19] skipped: no active checks enabled", flush=True)
+                        sweep_new |= new_sw
+    if start <= 15:
+        save_state(15, with_probes=True)
+    cdn = surfinfo.get("cdn", {})
+    _mark("B")
 
-    # ---------------- phase 19: nuclei ----------------
-    if a.nuclei and live:
-        print(f"[19/19] nuclei engine ({len(live)} hosts, "
-              f"sev={a.nuclei_sev}) ...", flush=True)
-        await nuclei_phase(live, probes, findings, a.nuclei_sev, a.nuclei_rate,
-                           a.nuclei_timeout)
-    else:
-        print("[19/19] nuclei skipped (--no-nuclei or no live hosts)", flush=True)
+    # ---------------- phase 19: nuclei (background task joined here) --------
+    if nuc_task is not None:
+        try:
+            await nuc_task
+        except Exception as e:
+            note_check_error("nuclei", f"failed: {e}")
+        if sweep_new:
+            # hosts discovered by the phase-16 sweep after the spawn-time
+            # snapshot: small second pass keeps --sweep coverage identical
+            # to the old run-at-the-end behavior
+            try:
+                await nuclei_phase(sweep_new, probes, findings, a.nuclei_sev,
+                                   a.nuclei_rate, a.nuclei_timeout)
+            except Exception as e:
+                note_check_error("nuclei", f"failed: {e}")
 
     # ---------------- outputs ----------------
     stop_flush[0] = True
@@ -15227,6 +15302,9 @@ async def main():
         await flush_task
     except (asyncio.CancelledError, Exception):
         pass
+    _mark("tail")
+    print("[timing] phases: " + " ".join(_tmarks)
+          + f" total={time.time() - t0:.0f}s", flush=True)
     linkfile = base + "_links" + ext
     endfile = base + "_endpoints" + ext
     crawlfile = base + "_crawl" + ext
