@@ -444,7 +444,10 @@ SEV = {"PORT-RISK": "critical", "TAKEOVER-CONFIRMED": "critical", "LEAK": "criti
           "SEARCH-ALLOWED": "medium", "MKCOL-ALLOWED": "high",
           "MOVE-ALLOWED": "high", "CONNECT-PROXY": "high",
           # ---- wave 25: AI/LLM API surface ----
-          "LLM-ENDPOINT": "info", "LLM-OPEN": "medium"}
+          "LLM-ENDPOINT": "info", "LLM-OPEN": "medium",
+          # ---- wave 26: protocol legacy + DNS recursion ----
+          "SSH-LEGACY": "medium", "SMB1-ENABLED": "medium",
+          "DNS-OPEN-RESOLVER": "medium", "DNS-VERSION-LEAK": "low"}
 
 # methods that should never be advertised on a hardened origin (wave 24)
 DANGEROUS_METHODS = ("PUT", "DELETE", "PATCH", "TRACE", "TRACK", "DEBUG",
@@ -4151,15 +4154,137 @@ async def pg_default(h, p, findings):
     return 0
 
 
+# SSH_MSG_KEXINIT algorithms that are legacy (SHA-1 kex/MAC, DSS/ssh-rsa host
+# keys, CBC/RC4/3DES ciphers). the server advertises its list in cleartext
+# before any auth, so that list itself is the evidence; a modern server
+# advertises none of these (the deny control)
+SSH_WEAK = {
+    "kex": ("diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1",
+            "diffie-hellman-group-exchange-sha1", "gss-group1-sha1-",
+            "gss-gex-sha1-"),
+    "hostkey": ("ssh-dss", "ssh-rsa"),
+    "cipher": ("arcfour", "3des-cbc", "des-cbc", "blowfish-cbc",
+               "cast128-cbc", "aes128-cbc", "aes192-cbc", "aes256-cbc",
+               "rijndael-cbc@"),
+    "mac": ("hmac-md5", "hmac-sha1", "hmac-ripemd160", "umac-64@"),
+}
+
+
+def _ssh_namelist(payload, off):
+    if off + 4 > len(payload):
+        raise ValueError("short kexinit")
+    ln = int.from_bytes(payload[off:off + 4], "big")
+    off += 4
+    if ln < 0 or off + ln > len(payload):
+        raise ValueError("bad namelist")
+    return payload[off:off + ln].decode("latin-1", "ignore"), off + ln
+
+
+async def ssh_legacy_check(h, p, findings):
+    """read the server's post-banner KEXINIT (cleartext, pre-auth) and flag
+    legacy kex/host-key/cipher/MAC names it advertises."""
+    try:
+        rd, wr = await asyncio.wait_for(asyncio.open_connection(h, p), 5)
+        try:
+            banner = await asyncio.wait_for(rd.readuntil(b"\n"), 4)
+            if not banner.startswith(b"SSH-"):
+                return 0
+            hdr = await asyncio.wait_for(rd.readexactly(5), 4)
+            plen = int.from_bytes(hdr[:4], "big")
+            pad = hdr[4]
+            if plen < 12 or plen > 8192 or pad >= plen - 1:
+                return 0
+            # packet_length counts the padding_length byte too, which the
+            # 5-byte header already consumed
+            body = await asyncio.wait_for(rd.readexactly(plen - 1), 4)
+        finally:
+            try:
+                wr.close()
+                await wr.wait_closed()
+            except Exception:
+                pass
+    except Exception:
+        return 0
+    payload = body[:plen - 1 - pad]
+    if len(payload) < 17 or payload[0] != 20:         # SSH_MSG_KEXINIT
+        return 0
+    try:
+        off = 17                                      # msg id + 16B cookie
+        lists = []
+        for _ in range(10):
+            val, off = _ssh_namelist(payload, off)
+            lists.append(val)
+    except ValueError:
+        return 0
+    weak = []
+    for label, idx in (("kex", 0), ("hostkey", 1),
+                       ("cipher", 2), ("mac", 4)):
+        got = sorted({n for n in lists[idx].split(",")
+                      if n and any(w in n for w in SSH_WEAK[label])})
+        if got:
+            weak.append(f"{label}={','.join(got[:3])}")
+    if not weak:
+        return 0
+    findings.append(
+        f"[SSH-LEGACY] {h}:{p} advertises legacy SSH algorithms "
+        f"({'; '.join(weak)}) - SHA-1/DSS/CBC-era crypto; remove them from "
+        f"KexAlgorithms/HostKeyAlgorithms/Ciphers/MACs")
+    return 1
+
+
+SMB1_DIALECTS = (b"PC NETWORK PROGRAM 1.0", b"LANMAN1.0",
+                 b"Windows for Workgroups 3.1a", b"LM1.2X002",
+                 b"LANMAN2.1", b"NT LM 0.12")
+
+
+def _smb1_negotiate():
+    dialects = b"".join(b"\x02" + d + b"\x00" for d in SMB1_DIALECTS)
+    body = (b"\xffSMB\x72" + b"\x00\x00\x00\x00"      # cmd, status
+            + b"\x18" + b"\x53\xc8"                   # flags, flags2
+            + b"\x00" * 20                            # pid-high..mid
+            + b"\x00"                                 # word count
+            + len(dialects).to_bytes(2, "little")     # byte count
+            + dialects)
+    return b"\x00" + len(body).to_bytes(3, "big") + body
+
+
+async def smb1_check(h, p, findings):
+    """SMBv1 dialect: a 0xFF 'SMB' + 0x72 (negotiate) reply to an SMB1
+    negotiate means the server still speaks SMBv1; a modern stack answers
+    0xFE 'SMB' (SMB2/3) instead - that is the deny control."""
+    try:
+        rd, wr = await asyncio.wait_for(asyncio.open_connection(h, p), 5)
+        try:
+            wr.write(_smb1_negotiate())
+            await wr.drain()
+            resp = await asyncio.wait_for(rd.read(4096), 4)
+        finally:
+            try:
+                wr.close()
+                await wr.wait_closed()
+            except Exception:
+                pass
+    except Exception:
+        return 0
+    if len(resp) >= 9 and resp[4:8] == b"\xffSMB" and resp[8] == 0x72:
+        findings.append(
+            f"[SMB1-ENABLED] {h}:{p} negotiates the SMBv1 dialect "
+            f"(0xFF SMB negotiate reply) - SMBv1 is deprecated/vulnerable "
+            f"(WannaCry-class); disable SMB1 and require SMB2/3 + signing")
+        return 1
+    return 0
+
+
 async def svc_probe(port_results, findings, cap=60):
     """unauthenticated service checks on open ports: docker/elastic/redis/
        memcached/etcd/rsync - evidence is the protocol answer itself."""
     hits = 0
     cands = {}
     for h, p, b in port_results:
-        if p in SVC_HTTP or p in SVC_RAW or p in (873, VNC_PORT, 27017, 3389,
-                                                   1099, 8009, 7001, 3306,
-                                                   143, 110, 5672):
+        if p in SVC_HTTP or p in SVC_RAW or p in (22, 445, 873, VNC_PORT,
+                                                   27017, 3389, 1099, 8009,
+                                                   7001, 3306, 143, 110,
+                                                   5672):
             cands.setdefault((h, p), b)
     cands = dict(list(cands.items())[:cap])      # advertised per-run cap
 
@@ -4860,6 +4985,10 @@ async def svc_probe(port_results, findings, cap=60):
             await pop3_check(h, p)
         elif p == 5672:
             await amqp_default(h, p)
+        elif p == 22:
+            hits += await ssh_legacy_check(h, p, findings)
+        elif p == 445:
+            hits += await smb1_check(h, p, findings)
 
     if cands:
         await asyncio.gather(*[one(h, p, b) for (h, p), b in list(cands.items())])
@@ -11135,6 +11264,100 @@ def _nsec_walk_sync(domain, server, max_steps=25):
     return names
 
 
+def _dns_res_probe(ip, port=53):
+    """threaded: recursion + CHAOS version probe against one NS IP. the
+    queried foreign name is deliberately NOT something this server is
+    authoritative for, so any A answer proves recursion service; REFUSED/
+    SERVFAIL/empty is the deny control."""
+    import dns.flags, dns.message, dns.rdataclass, dns.rdatatype
+    out = {}
+    try:
+        q = dns.message.make_query("version.bind", dns.rdatatype.TXT,
+                                   dns.rdataclass.CH)
+        r = dns.query.udp(q, ip, port=port, timeout=4)
+        for rr in r.answer:
+            for it in rr:
+                txt = getattr(it, "strings", None)
+                if not txt:
+                    continue
+                val = b"".join(txt).decode("latin-1", "ignore")
+                val = "".join(ch for ch in val if 32 <= ord(ch) < 127)[:80]
+                if val:
+                    out["version"] = val
+                    break
+            if out.get("version"):
+                break
+    except Exception:
+        pass
+    try:
+        q = dns.message.make_query("www.ietf.org", dns.rdatatype.A)
+        q.flags |= dns.flags.RD
+        r = dns.query.udp(q, ip, port=port, timeout=4)
+        if r.rcode() == 0 and any(rr.rdtype == dns.rdatatype.A
+                                  for rr in r.answer):
+            out["open"] = True
+    except Exception:
+        pass
+    if out.get("open"):
+        # a stale cache entry could answer the fixed name; a FRESH random
+        # label must be resolved upstream (NXDOMAIN or answer) to prove the
+        # server actually recurses rather than replaying a cached zone
+        try:
+            q = dns.message.make_query(os.urandom(6).hex() + ".example.org",
+                                       dns.rdatatype.A)
+            q.flags |= dns.flags.RD
+            r = dns.query.udp(q, ip, port=port, timeout=4)
+            if r.rcode() in (0, 3):
+                out["recursion"] = True
+        except Exception:
+            pass
+    return out
+
+
+async def dns_resolver_checks(domains, findings, cap=20):
+    """open recursion + version disclosure on each zone's AUTHORITATIVE NS.
+    the system resolver is never used here: it is recursive by definition and
+    would be a false positive."""
+    if not HAVE_DNSPY:
+        return 0
+    hits, seen = 0, set()
+    for d in domains[:cap]:
+        d = str(d).lower().strip(".")
+        if not d or "." not in d or "*" in d or "/" in d:
+            continue
+        try:
+            ans = await dns.asyncresolver.resolve(d, "NS", lifetime=5)
+            nss = [str(rr.target).rstrip(".").lower() for rr in ans][:2]
+        except Exception:
+            continue
+        for ns in nss:
+            if not ns or ns in seen:
+                continue
+            seen.add(ns)
+            try:
+                a = await dns.asyncresolver.resolve(ns, "A", lifetime=5)
+                ip = str(a[0].address)
+            except Exception:
+                continue
+            res = await asyncio.to_thread(_dns_res_probe, ip)
+            if res.get("open") and res.get("recursion"):
+                hits += 1
+                findings.append(
+                    f"[DNS-OPEN-RESOLVER] {ns} ({ip}) answers recursion "
+                    f"queries for foreign names (RD=1), including freshly "
+                    f"generated ones (real recursion, not a stale cache) - "
+                    f"open resolver usable for DNS amplification; restrict "
+                    f"recursion to your clients, keep the NS authoritative-only")
+            if res.get("version"):
+                hits += 1
+                findings.append(
+                    f"[DNS-VERSION-LEAK] {ns} ({ip}) discloses "
+                    f"`{res['version']}` via CHAOS TXT version.bind - "
+                    f"hide the version string (BIND: version "
+                    f"\"not disclosed\")")
+    return hits
+
+
 async def _ns_ip(d):
     """authoritative NS IPv4 for d (first that resolves), else system."""
     try:
@@ -12177,6 +12400,10 @@ REMEDIATION = {
     "SVC-RABBIT": "RabbitMQ management API unauthenticated - set management admin credentials and bind :15672 to a private network",
     "SVC-JENKINS": "Jenkins controller API readable anonymously - switch Authorization Strategy to logged-in users, disable Overall/Read for anonymous",
     "RDP-LEGACY": "RDP without Network Level Authentication/TLS - enable NLA (security layer TLS), restrict 3389 behind a gateway/VPN",
+    "SSH-LEGACY": "the SSH daemon advertises SHA-1/DSS/CBC/RC4-era algorithms - drop them from KexAlgorithms/HostKeyAlgorithms/Ciphers/MACs (OpenSSH 8.8+ defaults) and disable ssh-dss",
+    "SMB1-ENABLED": "SMBv1 is negotiated - disable SMB1 (Windows: Set-SmbServerConfiguration -EnableSMB1Protocol $false; Samba: server min protocol = SMB2), require signing, audit legacy clients",
+    "DNS-OPEN-RESOLVER": "the authoritative NS answers recursion queries for foreign names - restrict recursion to your clients (BIND allow-recursion / PowerDNS recursor ACL) and keep the NS authoritative-only",
+    "DNS-VERSION-LEAK": "the DNS server discloses its software version via CHAOS TXT version.bind - hide it (BIND: version \"not disclosed\"; NSD: hide-version: yes)",
     "GQL-SUGGEST": "GraphQL field suggestions leak the schema - disable field suggestions (Apollo: allow_experimental_cli or noSuggestion) + block introspection",
     "API-DUMP": "unauthenticated JSON record dump - require auth on the endpoint, paginate + field-filter responses, audit who can call it",
     "PARAM-SOURCE": "source disclosure - deny php://filter stream wrappers, allowlist file paths, serve code outside the webroot",
@@ -15284,6 +15511,9 @@ async def main():
         if a.mailsec and domains:
             tasks2.append(dns_hardening_checks(domains, findings))
             keys2.append("mailsec")
+        if a.mailsec and domains:
+            tasks2.append(dns_resolver_checks(domains, findings))
+            keys2.append("dnsrec")
         if a.nsecwalk and domains:
             tasks2.append(nsec_zone_walk(domains, findings))
             keys2.append("nsecwalk")
